@@ -208,7 +208,31 @@ resource "aws_instance" "k8s_workers" {
   }
 }
 
-# 7. Автоматическая генерация файла с IP-адресами для скриптов установки
+# 7. Автоматическая генерация inventory.ini для Ansible и env-файла
+resource "local_file" "ansible_inventory" {
+  content = <<-EOT
+    [master]
+    k8s-master ansible_host=${aws_instance.k8s_master.public_ip} private_ip=${aws_instance.k8s_master.private_ip}
+
+    [workers]
+    k8s-worker-1 ansible_host=${aws_instance.k8s_workers[0].public_ip} private_ip=${aws_instance.k8s_workers[0].private_ip}
+    k8s-worker-2 ansible_host=${aws_instance.k8s_workers[1].public_ip} private_ip=${aws_instance.k8s_workers[1].private_ip}
+
+    [k8s_cluster:children]
+    master
+    workers
+
+    [k8s_cluster:vars]
+    ansible_user=ubuntu
+    ansible_ssh_private_key_file=${abspath("${path.module}/k8s-research-key.pem")}
+    ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+    ansible_python_interpreter=/usr/bin/python3
+    master_private_ip=${aws_instance.k8s_master.private_ip}
+  EOT
+  filename        = "${path.module}/../ansible/inventory.ini"
+  file_permission = "0644"
+}
+
 resource "local_file" "cluster_env" {
   content = <<-EOT
     export SSH_KEY="${abspath("${path.module}/k8s-research-key.pem")}"
@@ -222,3 +246,4 @@ resource "local_file" "cluster_env" {
   filename        = "${path.module}/cluster_ips.env"
   file_permission = "0644"
 }
+

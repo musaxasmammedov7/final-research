@@ -16,10 +16,9 @@
 
 ---
 
-## Быстрый старт (Развертывание инфраструктуры)
+## Быстрый старт (Terraform + Ansible)
 
 ### Шаг 1. Настройка доступа к AWS на вашем компьютере
-Убедитесь, что у вас настроен AWS CLI:
 ```bash
 aws configure
 ```
@@ -33,14 +32,14 @@ terraform apply -auto-approve
 ```
 Что сделает Terraform автоматически:
 1. Создаст отдельную сеть VPC (`10.10.0.0/16`) и подсеть в одной зоне доступности (задержка между серверами `< 0.3 мс`).
-2. Сгенерирует SSH-ключ и сохранит его в `terraform/k8s-research-key.pem`.
-3. Создаст 3 сервера Ubuntu 24.04 и **автоматически отключит на них `source_dest_check`**, чтобы AWS не блокировал миграцию IP-адресов подов.
-4. Запишет все IP-адреса в файл `terraform/cluster_ips.env`.
+2. Сгенерирует локальный SSH-ключ `terraform/k8s-research-key.pem` (он добавлен в `.gitignore` и **никогда не попадет в GitHub**).
+3. Создаст 3 сервера Ubuntu 24.04 и **автоматически отключит на них `source_dest_check`**.
+4. Автоматически сгенерирует файл инвентаря **`ansible/inventory.ini`** с IP-адресами всех 3 серверов.
 
-### Шаг 3. Автоматическая установка Kubernetes, CRIU и Cilium Service Mesh (eBPF)
-Одной командой запустите полную настройку всех 3 серверов по SSH:
+### Шаг 3. Автоматическая настройка кластера через Ansible
 ```bash
-./scripts/bootstrap-all.sh
+cd ../ansible
+ansible-playbook site.yml
 ```
 
 ---
@@ -49,11 +48,14 @@ terraform apply -auto-approve
 
 ```text
 final-research/
-├── terraform/                  # Инфраструктура AWS EC2 (VPC, SG, 3x Ubuntu 24.04, SSH-ключи)
+├── terraform/                  # Инфраструктура AWS EC2 (VPC, SG, 3x Ubuntu 24.04)
 │   ├── main.tf
 │   ├── variables.tf
 │   └── outputs.tf
-├── scripts/                    # Автоматическая настройка ядра, CRIU, K8s и Cilium eBPF
+├── ansible/                    # Конфигурация серверов через Ansible (IaC)
+│   ├── ansible.cfg
+│   └── site.yml                # Playbook: ядро, CRIU, containerd, K8s v1.31 и Cilium Service Mesh
+├── scripts/                    # Альтернативные bash-скрипты и утилиты тестирования
 │   ├── 01-prepare-node.sh
 │   ├── 02-init-cluster-and-cilium.sh
 │   └── bootstrap-all.sh

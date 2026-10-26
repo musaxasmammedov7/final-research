@@ -1,0 +1,252 @@
+---
+# ==============================================================================
+# PLAY 1: Подготовка всех 3 серверов (Ядро Linux 6.8+, CRIU, Containerd, Kubelet)
+# ==============================================================================
+- name: "Этап 1: Настройка ядра Linux, CRIU и среды контейнеров на всех узлах"
+  hosts: k8s_cluster
+  become: true
+  tasks:
+    - name: "1.1 Установка имени хоста (hostname = k8s-master / k8s-worker-1 / k8s-worker-2)"
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: "1.2 Отключение Swap в оперативной памяти (требование kubelet и для чистых дампов CRIU)"
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: "1.3 Удаление Swap из /etc/fstab (чтобы не включался после перезагрузки)"
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+.*)$'
+        replace: '# \1'
+
+    - name: "1.4 Конфигурация автозагрузки модулей ядра overlay и br_netfilter"
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s-criu.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: "1.5 Немедленная загрузка модулей ядра overlay и br_netfilter"
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: "1.6 Тонкая настройка параметров ядра sysctl для Cilium eBPF и CRIU TCP_REPAIR"
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-k8s-criu-ebpf.conf
+        mode: "0644"
+        content: |
+          # Разрешаем маршрутизацию пакетов между контейнерами и нодами
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+          # Отключаем строгий rp_filter, чтобы Cilium eBPF и мигрировавшие Pod IP не дропались ядром
+          net.ipv4.conf.all.rp_filter         = 0
+          net.ipv4.conf.default.rp_filter     = 0
+          # Разрешаем механизм userfaultfd для Lazy Post-Copy миграции памяти в CRIU
+          vm.unprivileged_userfaultfd         = 1
+          # КРИТИЧНО ДЛЯ ЖИВОЙ МИГРАЦИИ TCP: разрешает ядру новой ноды подхватывать
+          # уже установленные TCP-соединения (без начального SYN-пакета)
+          net.netfilter.nf_conntrack_tcp_loose = 1
+
+    - name: "1.7 Применение настроек sysctl"
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: "1.8 Установка системных пакетов: CRIU, crun, containerd, conntrack, nftables, bpftool"
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - socat
+          - conntrack
+          - ipset
+          - iproute2
+          - nftables
+          - criu
+          - crun
+          - containerd
+          - linux-tools-common
+        state: present
+
+    - name: "1.9 Проверка поддержки CRIU в ядре Linux (criu check)"
+      ansible.builtin.command: criu check
+      register: criu_check_result
+      changed_when: false
+      failed_when: false
+
+    - name: "1.10 Вывод результата проверки CRIU"
+      ansible.builtin.debug:
+        msg: "Результат criu check на {{ inventory_hostname }}: {{ criu_check_result.stdout | default('OK') }}"
+
+    - name: "1.11 Создание базового конфига containerd"
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: "1.12 Включение SystemdCgroup = true в containerd (обязательно для K8s и CRIU cgroups v2)"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: Restart containerd
+
+    - name: "1.13 Перезапуск и включение службы containerd"
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: "1.14 Добавление официального GPG-ключа репозитория Kubernetes v1.31"
+      ansible.builtin.shell: |
+        mkdir -p -m 755 /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: "1.15 Подключение репозитория Kubernetes v1.31"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /\n"
+        mode: "0644"
+
+    - name: "1.16 Установка kubelet, kubeadm и kubectl"
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: "1.17 Включение Feature Gate ContainerCheckpoint=true в kubelet"
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: 'KUBELET_EXTRA_ARGS="--feature-gates=ContainerCheckpoint=true"'
+        mode: "0644"
+
+    - name: "1.18 Перезагрузка конфигурации systemd для kubelet"
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+        daemon_reload: true
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+
+# ==============================================================================
+# PLAY 2: Инициализация Control Plane и установка Cilium Service Mesh (eBPF)
+# ==============================================================================
+- name: "Этап 2: Инициализация Kubernetes Master и развертывание Cilium Service Mesh (eBPF)"
+  hosts: master
+  become: true
+  tasks:
+    - name: "2.1 Проверка, инициализирован ли уже кластер"
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: "2.2 Запуск kubeadm init (без стандартного kube-proxy — его заменит Cilium eBPF)"
+      ansible.builtin.command: >
+        kubeadm init
+        --apiserver-advertise-address={{ private_ip }}
+        --pod-network-cidr=10.244.0.0/16
+        --skip-phases=addon/kube-proxy
+      when: not k8s_admin_conf.stat.exists
+
+    - name: "2.3 Настройка kubeconfig для пользователя ubuntu"
+      ansible.builtin.shell: |
+        mkdir -p /home/ubuntu/.kube
+        cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+        chown -R ubuntu:ubuntu /home/ubuntu/.kube
+      changed_when: false
+
+    - name: "2.4 Установка Cilium CLI на мастер-ноду"
+      ansible.builtin.shell: |
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        curl -L --fail --remote-name-all "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz"
+        tar xzvfC cilium-linux-amd64.tar.gz /usr/local/bin
+        rm -f cilium-linux-amd64.tar.gz
+      args:
+        creates: /usr/local/bin/cilium
+
+    - name: "2.5 Проверка, установлен ли уже Cilium в кластере"
+      become: false
+      ansible.builtin.command: kubectl -n kube-system get daemonset cilium
+      register: cilium_ds
+      failed_when: false
+      changed_when: false
+
+    - name: "2.6 Установка Cilium Service Mesh с eBPF (kubeProxyReplacement=true, L7 Proxy, Hubble)"
+      become: false
+      ansible.builtin.command: >
+        cilium install
+        --version 1.16.3
+        --set kubeProxyReplacement=true
+        --set k8sServiceHost={{ private_ip }}
+        --set k8sServicePort=6443
+        --set bpf.masquerade=true
+        --set l7Proxy=true
+        --set hubble.enabled=true
+        --set hubble.relay.enabled=true
+        --set hubble.ui.enabled=true
+      when: cilium_ds.rc != 0
+
+    - name: "2.7 Генерация токена присоединения (join command) для Worker-нод"
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command_raw
+      changed_when: false
+
+    - name: "2.8 Сохранение команды подключения воркеров в общую переменную Ansible"
+      ansible.builtin.set_fact:
+        k8s_join_command: "{{ join_command_raw.stdout }}"
+
+
+# ==============================================================================
+# PLAY 3: Присоединение Worker-нод и финальная проверка Cilium eBPF
+# ==============================================================================
+- name: "Этап 3: Подключение k8s-worker-1 и k8s-worker-2 к кластеру"
+  hosts: workers
+  become: true
+  tasks:
+    - name: "3.1 Проверка, подключен ли уже воркер к кластеру"
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: "3.2 Присоединение воркера к кластеру (kubeadm join)"
+      ansible.builtin.command: "{{ hostvars['k8s-master'].k8s_join_command }}"
+      when: not kubelet_conf.stat.exists
+
+
+- name: "Этап 4: Финальная проверка готовности Cilium Service Mesh (eBPF) и всех нод"
+  hosts: master
+  become: false
+  tasks:
+    - name: "4.1 Ожидание перехода всех подов Cilium и нод в состояние Ready"
+      ansible.builtin.command: cilium status --wait
+      changed_when: false
+
+    - name: "4.2 Вывод списка узлов кластера"
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: nodes_out
+      changed_when: false
+
+    - name: "4.3 Статус кластера Kubernetes + Cilium eBPF"
+      ansible.builtin.debug:
+        msg: "{{ nodes_out.stdout_lines }}"
