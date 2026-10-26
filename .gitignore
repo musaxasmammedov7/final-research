@@ -1,0 +1,21 @@
+# Terraform & Runtime Secrets
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+*.pem
+*.key
+inventory.ini
+
+# Binaries & Build Artifacts
+bin/
+dist/
+*.exe
+*.out
+
+# Checkpoint dumps & temporary artifacts
+checkpoints/
+*.tar.gz
+*.img
+.DS_Store
