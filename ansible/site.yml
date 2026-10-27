@@ -66,6 +66,7 @@
           - ipset
           - iproute2
           - nftables
+          - iptables
           - criu
           - crun
           - runc
@@ -75,11 +76,15 @@
           - linux-tools-common
         state: present
 
-    - name: "1.9 Настройка /etc/criu/default.conf (без tcp-established, так как на целевой ноде выдается новый Pod IP)"
+    - name: "1.9 Настройка /etc/criu/default.conf (tcp-close: установленные TCP-соединения не переносятся, слушающие сокеты восстанавливаются)"
       ansible.builtin.copy:
         dest: /etc/criu/default.conf
         mode: "0644"
+        # Источник: https://criu.org/CLI/opt/--tcp-close - опция позволяет мигрировать серверы, слушающие 0.0.0.0,
+        # в окружение с другим IP: все TCP-соединения кроме CLOSED/LISTEN восстанавливаются закрытыми.
+        # tcp-established здесь НЕ используется: у пода на другой ноде будет другой Pod IP.
         content: |
+          tcp-close
           shell-job
           ext-unix-sk
 
@@ -135,6 +140,10 @@
         runtime_type = "oci"
         runtime_root = "/run/${OCI_RT}"
         EOF
+      changed_when: false
+
+    - name: "1.13b Удаление дефолтного bridge-CNI конфига CRI-O (чтобы сетью подов управлял только Cilium)"
+      ansible.builtin.shell: rm -f /etc/cni/net.d/*crio-bridge*.conflist /etc/cni/net.d/*crio-bridge*.conf
       changed_when: false
 
     - name: "1.14 Разрешение локального HTTP-реестра (10.10.1.10:5000) для пересылки OCI-образов чекпоинтов"
@@ -279,6 +288,22 @@
         return_content: true
       when: duckdns_token | length > 0
 
+    - name: "4.2b Проброс портов 80 и 443 на shared-listener Cilium Ingress (hostNetwork, порт 8080 по умолчанию)"
+      # Источник: docs.cilium.io (Ingress, Host network mode): sharedListenerPort по умолчанию 8080,
+      # а привилегированные порты требуют keepCapNetBindService. Вместо этого перенаправляем 80/443 -> 8080 на мастере.
+      become: true
+      ansible.builtin.iptables:
+        table: nat
+        chain: PREROUTING
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: REDIRECT
+        to_ports: "8080"
+        comment: "cilium-ingress-hostnetwork-{{ item }}"
+      loop:
+        - "80"
+        - "443"
+
     - name: "4.3 Установка cert-manager (Let's Encrypt SSL для Cilium Ingress)"
       ansible.builtin.command: >
         kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
@@ -324,6 +349,22 @@
         kubectl get pods -n boutique -o wide
       register: nodes_out
       changed_when: false
+
+    - name: "4.7b Smoke-test: shared-listener Cilium Ingress на 127.0.0.1:8080 (локальный OUTPUT не проходит через PREROUTING REDIRECT)"
+      ansible.builtin.shell: >
+        curl -s -o /dev/null -w '%{http_code}'
+        -H 'Host: {{ duckdns_domain }}.duckdns.org'
+        http://127.0.0.1:8080/live/state
+      register: ingress_smoke
+      changed_when: false
+      failed_when: false
+      retries: 12
+      delay: 10
+      until: ingress_smoke.stdout == "200"
+
+    - name: "4.7c Результат smoke-теста Ingress (ожидается 200; иное значение - проверить Cilium Ingress; внешний доступ 80/443 нужно проверить с другой машины)"
+      ansible.builtin.debug:
+        msg: "HTTP status /live/state via Cilium Ingress listener :8080 = {{ ingress_smoke.stdout }}"
 
     - name: "4.8 Статус кластера"
       ansible.builtin.debug:

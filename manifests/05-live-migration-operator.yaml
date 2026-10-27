@@ -1,16 +1,21 @@
 # ==============================================================================
-# АВТОНОМНЫЙ ОПЕРАТОР ЖИВОЙ МИГРАЦИИ ПАМЯТИ (CRI-O + CRIU + Buildah + Registry)
+# ОПЫТНЫЙ ОПЕРАТОР МИГРАЦИИ СОСТОЯНИЯ ПОДА (CRI-O + CRIU + Buildah + Registry)
 # ------------------------------------------------------------------------------
-# Реализует полный эталонный цикл по документации Kubernetes KEP-2008 / CRI-O:
+# Исследовательский прототип. ВАЖНО: KEP-2008 (Forensic Container Checkpointing) описывает ТОЛЬКО
+# kubelet Checkpoint API для форензики; миграция контейнеров там явно названа Non-Goal.
+# Конвейер ниже - собственная реализация поверх этого API и документированного способа восстановления
+# чекпоинта из OCI-образа (аннотация io.kubernetes.cri-o.annotations.checkpoint.name, см. CRI-O server/container_restore.go).
+# Триггеры (cordon / метки spot-interruption и consolidate-node) - собственное проектное решение,
+# они НЕ взяты из KEP-2008.
+#
 # 1. Внутренний OCI-реестр чекпоинтов (10.10.1.10:5000) на мастер-ноде;
-# 2. Автоматическое обнаружение 3 официальных триггеров из KEP-2008 (NodeMaintenance,
-#    SpotInstancePreemption, ClusterConsolidation);
-# 3. Выполнение полного 4-шагового пайплайна на исходном воркере (DaemonSet + nsenter):
+# 2. Автоматическое обнаружение триггеров (NodeMaintenance, SpotInstancePreemption, ClusterConsolidation);
+# 3. Полный 4-шаговый пайплайн на исходном воркере (DaemonSet + nsenter):
 #    - T_dump:     POST /checkpoint/boutique/live-stream-pod/stream-server
 #    - T_build:    buildah from scratch + add tar + io.kubernetes.cri-o.annotations.checkpoint.name=stream-server
-#    - T_transfer: buildah push --tls-verify=false 10.10.1.10:5000/stream-server-checkpoint:latest
-#    - T_restore:  Привязка нового пода через spec.nodeName к целевому воркеру (k8s-worker-2)
-#                  и ожидание реального HTTP 200 ответа от восстановленного процесса!
+#    - T_transfer: buildah push --tls-verify=false 10.10.1.10:5000/stream-server-checkpoint:<имя-PLM>
+#    - T_restore:  Привязка нового пода через spec.nodeName к целевому воркеру
+#                  и ожидание реального HTTP 200 ответа от восстановленного процесса.
 # ==============================================================================
 
 # 0. Локальный OCI Registry на мастер-ноде (10.10.1.10:5000) для обмена образами чекпоинтов
@@ -77,9 +82,12 @@ spec:
         - name: Phase
           type: string
           jsonPath: .status.phase
-        - name: TotalDowntime
+        - name: TotalDuration
           type: string
-          jsonPath: .status.totalDowntime
+          jsonPath: .status.totalDuration
+        - name: HTTPBlackout
+          type: string
+          jsonPath: .status.httpBlackout
         - name: Breakdown
           type: string
           jsonPath: .status.breakdown
@@ -104,7 +112,9 @@ spec:
               properties:
                 phase:
                   type: string
-                totalDowntime:
+                totalDuration:
+                  type: string
+                httpBlackout:
                   type: string
                 breakdown:
                   type: string
@@ -147,32 +157,37 @@ data:
     import time
     import urllib.request
 
-    APISERVER = "https://kubernetes.default.svc"
+    # Pod с hostNetwork использует DNS ноды (не CoreDNS), поэтому kubernetes.default.svc не резолвится.
+    # Берем ClusterIP API-сервера из переменных окружения, которые kubelet инжектирует в каждый под.
+    APISERVER = f"https://{os.environ.get('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc')}:{os.environ.get('KUBERNETES_SERVICE_PORT', '443')}"
     TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
     MY_NODE = os.environ.get("NODE_NAME", socket.gethostname())
-    REGISTRY_IMAGE = "10.10.1.10:5000/stream-server-checkpoint:latest"
+    CHECKPOINT_REPO = "10.10.1.10:5000/stream-server-checkpoint"
 
     def get_token():
         with open(TOKEN_PATH, "r") as f:
             return f.read().strip()
 
+    SSL_CTX = ssl.create_default_context(cafile=CA_PATH)
+
     def k8s_request(path, method="GET", body=None, content_type="application/json"):
         token = get_token()
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         headers = {"Authorization": f"Bearer {token}", "Content-Type": content_type}
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(f"{APISERVER}{path}", data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+        with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def host_cmd(cmd_str):
+    def host_cmd(cmd_str, timeout=300):
         """Выполняет команду в корневом пространстве имен ноды (nsenter в PID 1) для доступа к /var/lib/kubelet/checkpoints и buildah."""
-        return subprocess.run(
+        r = subprocess.run(
             ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "bash", "-c", cmd_str],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, timeout=timeout
         )
+        if r.returncode != 0:
+            raise RuntimeError(f"host command failed (rc={r.returncode}): {(r.stderr or r.stdout).strip()[-400:]}")
+        return r
 
     def probe_pod_counter(pod_ip, timeout=0.5):
         if not pod_ip:
@@ -230,7 +245,13 @@ data:
 
         pods = k8s_request("/api/v1/namespaces/boutique/pods").get("items", [])
         existing_plms = k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations").get("items", [])
-        active_pods = {p["spec"]["podName"] for p in existing_plms if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")}
+        # Не создаем новую миграцию, если для пода с этого узла уже есть PLM в любом статусе, кроме Succeeded
+        # (Pending/Migrating/Failed). Иначе при ошибке оператор бы бесконечно повторял дамп каждую секунду.
+        # Чтобы повторить после Failed: kubectl delete plm <name> -n boutique
+        active_pods = {
+            p["spec"]["podName"] for p in existing_plms
+            if p.get("status", {}).get("phase") != "Succeeded" and p["spec"].get("sourceNode") == MY_NODE
+        }
 
         for pod in pods:
             pod_name = pod["metadata"]["name"]
@@ -252,8 +273,11 @@ data:
                 }
                 k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations", method="POST", body=body)
 
-    def update_status(ns, name, phase, total_dt="-", breakdown="-", msg=""):
-        patch = {"status": {"phase": phase, "totalDowntime": total_dt, "breakdown": breakdown, "message": msg}}
+    def update_status(ns, name, phase, total_duration="-", breakdown="-", msg="", http_blackout="-"):
+        patch = {"status": {
+            "phase": phase, "totalDuration": total_duration, "httpBlackout": http_blackout,
+            "breakdown": breakdown, "message": msg,
+        }}
         k8s_request(
             f"/apis/migration.research.io/v1alpha1/namespaces/{ns}/podlivemigrations/{name}/status",
             method="PATCH", body=patch, content_type="application/merge-patch+json"
@@ -262,34 +286,33 @@ data:
     def execute_migration_pipeline(ns, plm_name, pod_name, src_node, dst_node, reason):
         update_status(ns, plm_name, "Migrating", "-", "Step 1/4: Kubelet CRIU Checkpoint", f"[{reason}] Starting CRI-O checkpoint")
         token = get_token()
-        ckpt_image = f"10.10.1.10:5000/stream-server-checkpoint:{plm_name}"
+        ckpt_image = f"{CHECKPOINT_REPO}:{plm_name}"
 
         src_pod = k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}")
         src_pod_ip = src_pod.get("status", {}).get("podIP")
         counter_at_dump = probe_pod_counter(src_pod_ip)
 
-        # ШАГ 1: Kubelet Checkpoint API (:10250/checkpoint с Bearer-аутентификацией cluster-admin)
+        # ШАГ 1: Kubelet Checkpoint API (:10250/checkpoint с Bearer-аутентификацией cluster-admin).
+        # CRI-O 1.31 (server/container_checkpoint.go) вызывает checkpoint с KeepRunning=true, поэтому исходный
+        # контейнер продолжает работать и обслуживать трафик до момента удаления пода на шаге 4.
         t0 = time.monotonic()
         host_cmd(f"rm -f /var/lib/kubelet/checkpoints/checkpoint-{pod_name}_{ns}-stream-server-*.tar")
-        host_cmd(f"curl -skf -X POST -H 'Authorization: Bearer {token}' https://localhost:10250/checkpoint/{ns}/{pod_name}/stream-server")
+        host_cmd(f"curl -sf -m 120 -k -X POST -H 'Authorization: Bearer {token}' https://localhost:10250/checkpoint/{ns}/{pod_name}/stream-server")
         t1 = time.monotonic()
         dump_ms = int((t1 - t0) * 1000)
 
         # ШАГ 2: Упаковка архива чекпоинта в OCI-образ через Buildah с аннотацией CRI-O
+        # (официальная процедура: kubernetes.io -> Forensic container checkpointing -> Restore a checkpointed container)
         update_status(ns, plm_name, "Migrating", "-", f"Dump={dump_ms}ms | Step 2/4: Buildah OCI", "Packaging CRIU tar into OCI image")
         build_script = f"""
         set -e
         TAR_FILE=$(ls -t /var/lib/kubelet/checkpoints/checkpoint-{pod_name}_{ns}-stream-server-*.tar | head -n 1)
         CID=$(buildah from scratch)
         buildah add "$CID" "$TAR_FILE" /
-        MNT=$(buildah mount "$CID")
-        if [ -f "$MNT/config.dump" ]; then
-          python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["rootfsImageName"]="docker.io/library/python:3.12-slim"; json.dump(d,open(p,"w"))' "$MNT/config.dump"
-        fi
-        buildah umount "$CID"
         buildah config --annotation=io.kubernetes.cri-o.annotations.checkpoint.name=stream-server "$CID"
         buildah commit "$CID" {ckpt_image}
         buildah rm "$CID"
+        rm -f "$TAR_FILE"
         """
         host_cmd(build_script)
         t2 = time.monotonic()
@@ -298,23 +321,32 @@ data:
         # ШАГ 3: Отправка OCI-образа чекпоинта во внутренний HTTP-реестр кластера (tls-verify=false)
         update_status(ns, plm_name, "Migrating", "-", f"Dump={dump_ms}ms, Build={build_ms}ms | Step 3/4: Push", "Pushing OCI checkpoint image")
         host_cmd(f"buildah push --tls-verify=false {ckpt_image}")
+        host_cmd(f"buildah rmi {ckpt_image} || true")
         t3 = time.monotonic()
         push_ms = int((t3 - t2) * 1000)
 
-        # Замеряем счетчик на исходной ноде непосредственно перед удалением пода (пока шли Build + Push, под продолжал считать)
+        # Замеряем счетчик на исходной ноде непосредственно перед удалением пода.
+        # Пока шли Build + Push, исходный контейнер продолжал работать (KeepRunning=true) и считать;
+        # все изменения состояния после момента дампа будут потеряны - это ограничение snapshot-миграции.
         counter_at_kill = probe_pod_counter(src_pod_ip)
         t_kill = time.monotonic()
 
-        # ШАГ 4: Удаление старого пода на src_node и запуск восстановленного пода на dst_node через spec.nodeName
+        # ШАГ 4: Удаление старого пода на src_node и запуск восстановленного пода на dst_node через spec.nodeName.
+        # С этого момента и до первого HTTP 200 от восстановленного процесса сервис недоступен (HTTP blackout).
         update_status(ns, plm_name, "Migrating", "-", f"Dump={dump_ms}ms, Build={build_ms}ms, Push={push_ms}ms | Step 4/4: Restore", f"Restoring on {dst_node}")
         k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}?gracePeriodSeconds=0", method="DELETE")
-        for _ in range(50):
+        deadline = time.monotonic() + 60
+        while True:
             try:
                 k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}")
-                time.sleep(0.1)
             except Exception:
                 break
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"old pod {pod_name} was not deleted within 60s")
+            time.sleep(0.1)
 
+        # Набор bind-mount'ов восстановленного пода должен совпадать с исходным (CRI-O проверяет это в
+        # CRImportCheckpoint), поэтому спецификация зеркалит исходную: без ServiceAccount-токена, те же порты.
         restored_pod = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -336,8 +368,14 @@ data:
         # Ожидание не просто статуса Running, а реального ответа HTTP 200 от восстановленного процесса на dst_node!
         dst_pod_ip = None
         counter_at_restore = None
-        for _ in range(300):
+        last_state = "unknown"
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
             p = k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}")
+            cs = (p.get("status", {}).get("containerStatuses") or [{}])[0]
+            waiting = cs.get("state", {}).get("waiting")
+            if waiting:
+                last_state = f"{waiting.get('reason')}: {waiting.get('message', '')}"[:300]
             if p.get("status", {}).get("phase") == "Running":
                 dst_pod_ip = p.get("status", {}).get("podIP")
                 c_val = probe_pod_counter(dst_pod_ip, timeout=0.2)
@@ -347,7 +385,7 @@ data:
             time.sleep(0.05)
 
         if counter_at_restore is None:
-            raise RuntimeError(f"CRI-O restore or HTTP 200 verification failed on {dst_node}")
+            raise RuntimeError(f"restore on {dst_node} did not return HTTP 200 within 120s; container state: {last_state}")
 
         t4 = time.monotonic()
         restore_ms = int((t4 - t3) * 1000)
@@ -358,20 +396,21 @@ data:
             f"| HTTP_Blackout:{http_blackout_ms}ms | Counter({counter_at_dump}->{counter_at_kill}->{counter_at_restore})"
         )
 
-        if dst_pod_ip:
-            notify_restored_pod(dst_pod_ip, {
-                "name": plm_name,
-                "source": src_node,
-                "target": dst_node,
-                "reason": reason,
-                "phase": "Succeeded",
-                "downtime": f"{total_ms}ms (HTTP blackout: {http_blackout_ms}ms)",
-                "breakdown": breakdown,
-            })
+        notify_restored_pod(dst_pod_ip, {
+            "name": plm_name,
+            "source": src_node,
+            "target": dst_node,
+            "reason": reason,
+            "phase": "Succeeded",
+            "duration": f"{total_ms}ms",
+            "blackout": f"{http_blackout_ms}ms",
+            "breakdown": breakdown,
+        })
 
         update_status(
-            ns, plm_name, "Succeeded", f"{total_ms}ms (HTTP:{http_blackout_ms}ms)", breakdown,
-            f"Restored via CRI-O on {dst_node} (counter: dump={counter_at_dump}, kill={counter_at_kill}, restore={counter_at_restore})"
+            ns, plm_name, "Succeeded", f"{total_ms}ms", breakdown,
+            f"Restored via CRI-O on {dst_node} (counter: dump={counter_at_dump}, kill={counter_at_kill}, restore={counter_at_restore})",
+            http_blackout=f"{http_blackout_ms}ms",
         )
 
     def reconcile():
@@ -393,7 +432,7 @@ data:
                             ns, name, spec["podName"], spec["sourceNode"], spec["targetNode"], spec.get("triggerReason", "Manual")
                         )
                     except Exception as pipe_err:
-                        update_status(ns, name, "Failed", "-", str(pipe_err)[:120], f"Pipeline error: {pipe_err}")
+                        update_status(ns, name, "Failed", "-", "-", f"Pipeline error: {pipe_err}"[:500])
             except Exception as e:
                 print(f"Operator loop error: {e}", flush=True)
             time.sleep(1)
@@ -419,6 +458,7 @@ spec:
       serviceAccountName: live-migration-operator-sa
       hostNetwork: true
       hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: operator
           image: docker.io/library/python:3.12-slim

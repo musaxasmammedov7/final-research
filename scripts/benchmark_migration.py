@@ -7,8 +7,9 @@
      - Проверка непрерывности и разрыва счётчика: counter_at_dump -> counter_at_kill -> counter_at_restore.
   2. Baseline 1 — Standard Cold Reschedule (обычное пересоздание пода без CRIU):
      - Замеряет External HTTP Blackout и демонстрирует полную потерю состояния в RAM (сброс в 0).
-  3. Baseline 2 — Redis State Replication (репликация состояния через внешний сервис redis-cart:6379):
-     - Замеряет накладные расходы синхронной записи каждого тика по сети в Redis и время восстановления.
+  3. Baseline 2 — внешнее хранилище состояния (Redis, redis-cart:6379):
+     - Замеряет только сетевую задержку синхронной записи одного изменения состояния в Redis
+       (время восстановления и репликация Redis не измеряются).
 """
 
 import argparse
@@ -145,8 +146,8 @@ def run_single_criu_migration(run_idx, src_node, dst_node, svc_url):
     }
 
 
-def run_baseline_cold_reschedule(dst_node, svc_url):
-    """Baseline 1: Обычный Reschedule без CRIU (удаление пода и холодный старт на целевой ноде с потерей RAM)."""
+def run_baseline_cold_reschedule(svc_url):
+    """Baseline 1: Обычный Reschedule без CRIU (удаление пода и холодный старт заново из манифеста с потерей RAM)."""
     with urllib.request.urlopen(svc_url, timeout=1.0) as r:
         before_kill = json.loads(r.read().decode("utf-8")).get("ram_counter")
 
@@ -182,7 +183,7 @@ def run_baseline_cold_reschedule(dst_node, svc_url):
 
 
 def run_baseline_redis_replication():
-    """Baseline 2: Замер RTT синхронной репликации состояния каждого тика во внешний Redis (redis-cart:6379)."""
+    """Baseline 2: Замер RTT синхронной записи состояния во внешнее хранилище (redis-cart:6379). Это задержка записи, а не полноценная Redis-репликация."""
     redis_ip = sh("kubectl get svc redis-cart -n boutique -o jsonpath='{.spec.clusterIP}'")
     py_code = (
         "import socket, time\n"
@@ -242,12 +243,12 @@ def main():
     print("\n=== PART 2: BASELINE COMPARISONS ===")
     redis_base = run_baseline_redis_replication()
     print(
-        f"- [Baseline 2: Redis Replication (redis-cart:6379)] "
+        f"- [Baseline 2: External state store, Redis (redis-cart:6379)] "
         f"Sync network write overhead per state mutation = {redis_base['avg_write_rtt_ms']:.3f} ms/op "
         f"(requires app refactoring & external DB)"
     )
 
-    cold_base = run_baseline_cold_reschedule("k8s-worker-1", svc_url)
+    cold_base = run_baseline_cold_reschedule(svc_url)
     print(
         f"- [Baseline 1: Standard Cold Reschedule (no CRIU)]  "
         f"Ext_HTTP_Blackout = {cold_base['ext_blackout_ms']} ms | "

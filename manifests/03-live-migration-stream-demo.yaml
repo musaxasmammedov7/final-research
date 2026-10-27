@@ -5,6 +5,7 @@
 # - automountServiceAccountToken: false (нулевые внешние тома для чистого CRIU dump/restore)
 # - Отсутствие исходящих TCP-соединений (чистый слушающий сокет 0.0.0.0:8090 HTTP/1.0)
 # - Динамическое определение нового Pod IP через локальную таблицу маршрутизации ядра
+# - Набор bind-mount'ов должен совпадать у исходного и восстановленного пода (CRI-O проверяет это при restore)
 # ==============================================================================
 apiVersion: v1
 kind: Pod
@@ -75,7 +76,7 @@ spec:
             <div class="top">
               <div>
                 <h2 style="margin:0;">🚀 Стенд миграции состояния RAM (CRI-O + CRIU + Buildah + Cilium eBPF)</h2>
-                <p style="margin:4px 0 0; color:#94a3b8; font-size:14px;">Эталонный конвейер KEP-2008: Kubelet Checkpoint &rarr; Buildah OCI Image &rarr; CRI-O Restore на целевой ноде</p>
+                <p style="margin:4px 0 0; color:#94a3b8; font-size:14px;">Исследовательский прототип поверх kubelet Checkpoint API (KEP-2008): Checkpoint &rarr; Buildah OCI Image &rarr; CRI-O Restore на целевой ноде</p>
               </div>
               <a href="/">🛒 Магазин Google Boutique &rarr;</a>
             </div>
@@ -90,12 +91,12 @@ spec:
               <div class="step" id="st1"><h4>1. Kubelet Checkpoint API</h4><p>Вызов <code>POST /checkpoint</code> в CRI-O на исходной ноде. CRIU сохраняет страницы RAM в tar-архив (<code>T_dump</code>).</p></div>
               <div class="step" id="st2"><h4>2. Buildah OCI Packaging</h4><p>Упаковка архива CRIU в OCI-образ с аннотацией <code>io.kubernetes.cri-o.annotations.checkpoint.name</code> (<code>T_build</code>).</p></div>
               <div class="step" id="st3"><h4>3. Registry Transfer</h4><p>Передача OCI-образа чекпоинта через локальный реестр кластера на целевую ноду (<code>T_transfer</code>).</p></div>
-              <div class="step" id="st4"><h4>4. CRI-O Restore &amp; Cilium</h4><p>CRI-O распаковывает дамп через <code>criu restore</code> (счетчик RAM продолжается с момента дампа!), Cilium eBPF обновляет Endpoint (<code>T_restore</code>).</p></div>
+              <div class="step" id="st4"><h4>4. CRI-O Restore &amp; Cilium</h4><p>CRI-O распаковывает дамп через <code>criu restore</code> (счетчик RAM продолжается со значения на момент дампа), Cilium eBPF обновляет Endpoint (<code>T_restore</code>).</p></div>
             </div>
             <div class="card" style="margin-top:20px;">
               <div class="label">Журнал оператора (<code>kubectl get podlivemigrations -n boutique</code>):</div>
-              <table><thead><tr><th>Задача</th><th>Маршрут</th><th>Триггер</th><th>Фаза</th><th>Полный пайплайн</th><th>Разбивка фаз и состояние счетчика (Dump &rarr; Kill &rarr; Restore)</th></tr></thead>
-              <tbody id="plm_body"><tr><td colspan="6" style="color:#64748b;">Ожидание триггера (например: <code>kubectl cordon k8s-worker-1</code>)...</td></tr></tbody></table>
+              <table><thead><tr><th>Задача</th><th>Маршрут</th><th>Триггер</th><th>Фаза</th><th>Длительность пайплайна</th><th>HTTP blackout</th><th>Разбивка фаз и счетчик (до дампа &rarr; перед удалением &rarr; после restore)</th></tr></thead>
+              <tbody id="plm_body"><tr><td colspan="7" style="color:#64748b;">Ожидание триггера (например: <code>kubectl cordon k8s-worker-1</code>)...</td></tr></tbody></table>
             </div>
           </div>
           <script>
@@ -113,7 +114,7 @@ spec:
                 document.getElementById('max_gap').innerText = maxGap + ' ms';
                 if (d.migrations && d.migrations.length > 0) {
                   for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.add('active');
-                  document.getElementById('plm_body').innerHTML = d.migrations.map(m => `<tr><td>${m.name}</td><td>${m.source} &rarr; ${m.target}</td><td>${m.reason}</td><td style="color:#4ade80;font-weight:700;">${m.phase}</td><td>${m.downtime}</td><td>${m.breakdown}</td></tr>`).join('');
+                  document.getElementById('plm_body').innerHTML = d.migrations.map(m => `<tr><td>${m.name}</td><td>${m.source} &rarr; ${m.target}</td><td>${m.reason}</td><td style="color:#4ade80;font-weight:700;">${m.phase}</td><td>${m.duration}</td><td>${m.blackout}</td><td>${m.breakdown}</td></tr>`).join('');
                 }
               } catch (e) {}
               setTimeout(poll, 200);
@@ -146,6 +147,13 @@ spec:
                       self.wfile.write(HTML.encode("utf-8"))
 
               def do_POST(self):
+                  # Запись принимается только напрямую от оператора. Запросы через Ingress (Envoy) несут
+                  # заголовок X-Forwarded-For / X-Envoy-External-Address и отклоняются.
+                  if self.headers.get("X-Forwarded-For") or self.headers.get("X-Envoy-External-Address"):
+                      self.send_response(403)
+                      self.send_header("Connection", "close")
+                      self.end_headers()
+                      return
                   if self.path.startswith("/live/record"):
                       length = int(self.headers.get("Content-Length", "0"))
                       payload = json.loads(self.rfile.read(length).decode("utf-8"))
