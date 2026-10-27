@@ -1,266 +1,11 @@
 # ==============================================================================
-# ВИЗУАЛЬНЫЙ ЦЕНТР ЖИВОЙ МИГРАЦИИ (/live) ДЛЯ GOOGLE ONLINE BOUTIQUE
+# ВИЗУАЛЬНЫЙ ЦЕНТР МИГРАЦИИ ПАМЯТИ (CRI-O + CRIU + Buildah + Cilium eBPF)
 # ------------------------------------------------------------------------------
 # Открывается по адресу: https://musa-research.duckdns.org/live
-# Показывает в реальном времени:
-# 1. Непрерывное открытое TCP-соединение (SSE Stream) и счетчик в RAM;
-# 2. Связь с 11 микросервисами Google Online Boutique (redis-cart + frontend);
-# 3. Визуальную схему из 4 этапов (ПОЧЕМУ миграция проходит без обрыва связи):
-#    [1. Триггер KEP-5823] -> [2. CRIU Pre-Copy RAM] -> [3. TCP_REPAIR] -> [4. Cilium eBPF]
-# 4. Живую таблицу объектов `kind: PodLiveMigration` напрямую из Kubernetes API.
+# - automountServiceAccountToken: false (нулевые внешние тома для чистого CRIU dump/restore)
+# - Отсутствие исходящих TCP-соединений (чистый слушающий сокет 0.0.0.0:8090 HTTP/1.0)
+# - Динамическое определение нового Pod IP через локальную таблицу маршрутизации ядра
 # ==============================================================================
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: live-stream-app-code
-  namespace: boutique
-data:
-  server.py: |
-    import http.server
-    import json
-    import os
-    import socket
-    import ssl
-    import time
-    import urllib.request
-    from threading import Thread
-
-    STATE = {
-        "ram_counter": 0,
-        "started_at": time.strftime("%H:%M:%S"),
-        "pid": os.getpid(),
-    }
-
-    def counter_loop():
-        while True:
-            STATE["ram_counter"] += 1
-            time.sleep(0.1)
-
-    Thread(target=counter_loop, daemon=True).start()
-
-    def get_k8s_migrations():
-        """Читает реальный список объектов kind: PodLiveMigration из Kubernetes API."""
-        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-        if not os.path.exists(token_path):
-            return []
-        try:
-            with open(token_path, "r") as f:
-                token = f.read().strip()
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            req = urllib.request.Request(
-                "https://kubernetes.default.svc/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            with urllib.request.urlopen(req, context=ctx, timeout=2) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                out = []
-                for item in data.get("items", []):
-                    spec = item.get("spec", {})
-                    st = item.get("status", {})
-                    out.append({
-                        "name": item["metadata"]["name"],
-                        "pod": spec.get("podName", ""),
-                        "source": spec.get("sourceNode", ""),
-                        "target": spec.get("targetNode", ""),
-                        "reason": spec.get("triggerReason", "KEP-5823"),
-                        "phase": st.get("phase", "Pending"),
-                        "freeze": st.get("freezeTime", "-"),
-                        "msg": st.get("message", ""),
-                    })
-                return out
-        except Exception:
-            return []
-
-    def check_redis_cart():
-        """Проверяет живое TCP-соединение с корзиной Google Online Boutique (redis-cart:6379)."""
-        try:
-            s = socket.create_connection(("redis-cart", 6379), timeout=0.5)
-            s.sendall(b"PING\r\n")
-            resp = s.recv(32).decode("utf-8", errors="ignore").strip()
-            s.close()
-            return "CONNECTED (+PONG)" if "PONG" in resp else "ONLINE"
-        except Exception:
-            return "CONNECTING..."
-
-    HTML_PAGE = """<!DOCTYPE html>
-    <html lang="ru">
-    <head>
-      <meta charset="UTF-8">
-      <title>CRIU + Cilium eBPF Live Migration Visualizer</title>
-      <style>
-        body { font-family: system-ui, -apple-system, sans-serif; background: #0b0f19; color: #f8fafc; margin: 0; padding: 24px; }
-        .wrap { max-width: 1040px; margin: 0 auto; }
-        .top { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }
-        .top a { color: #38bdf8; text-decoration: none; font-weight: 600; background: #1e293b; padding: 8px 14px; border-radius: 8px; }
-        .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 20px; }
-        .card { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 16px; }
-        .label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
-        .val { font-size: 24px; font-weight: 700; margin-top: 6px; font-family: ui-monospace, monospace; color: #38bdf8; }
-        .ok { color: #4ade80; }
-        .pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 20px; }
-        .step { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px; position: relative; }
-        .step.active { border-color: #4ade80; background: #06281e; }
-        .step h4 { margin: 0 0 6px 0; font-size: 14px; color: #f8fafc; }
-        .step p { margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.4; }
-        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
-        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #1f2937; font-family: ui-monospace, monospace; }
-        th { color: #94a3b8; font-weight: 600; }
-      </style>
-    </head>
-    <body>
-      <div class="wrap">
-        <div class="top">
-          <div>
-            <h2 style="margin:0;">🚀 Визуализатор живой миграции (CRIU + Cilium Service Mesh eBPF)</h2>
-            <p style="margin:4px 0 0; color:#94a3b8; font-size:14px;">Стенд в реальном времени показывает, как сохраняется оперативная память (RAM) и открытый TCP-поток при выводе ноды</p>
-          </div>
-          <a href="/">🛒 Открыть магазин Google Boutique (11 микросервисов) &rarr;</a>
-        </div>
-
-        <div class="grid">
-          <div class="card">
-            <div class="label">Счетчик состояния в RAM</div>
-            <div class="val ok" id="counter">0</div>
-          </div>
-          <div class="card">
-            <div class="label">IP-адрес Пода (Cilium eBPF)</div>
-            <div class="val" id="pod_ip">...</div>
-          </div>
-          <div class="card">
-            <div class="label">Непрерывный TCP-стрим</div>
-            <div class="val ok" id="tcp_status">CONNECTED (0 drops)</div>
-          </div>
-          <div class="card">
-            <div class="label">Связь с корзиной (redis-cart)</div>
-            <div class="val ok" id="redis_status">...</div>
-          </div>
-        </div>
-
-        <h3 style="margin-top:26px; margin-bottom:8px; font-size:16px;">Почему миграция проходит успешно без разрыва связи (4 механизма под капотом):</h3>
-        <div class="pipeline">
-          <div class="step" id="st1">
-            <h4>1. Триггер KEP-5823</h4>
-            <p>Оператор автоматически обнаруживает <code>NodeMaintenance</code> (drain), <code>SpotPreemption</code> или <code>Consolidation</code> и создает объект <code>kind: PodLiveMigration</code>.</p>
-          </div>
-          <div class="step" id="st2">
-            <h4>2. CRIU Pre-Copy RAM</h4>
-            <p>Фоновый снимок оперативной памяти контейнера (<code>criu pre-dump</code>), пока приложение и магазин Google Boutique продолжают обслуживать трафик.</p>
-          </div>
-          <div class="step" id="st3">
-            <h4>3. Сохранение сокета (TCP_REPAIR)</h4>
-            <p>Заморозка пакета <code>TCP RST</code> в ядре (`nf_conntrack_tcp_loose=1`) и перенос состояния активного TCP-соединения (`Sequence/Ack` номеров).</p>
-          </div>
-          <div class="step" id="st4">
-            <h4>4. Переключение Cilium eBPF</h4>
-            <p>Sidecar-free архитектура Cilium мгновенно переключает маршрут в таблицах ядра eBPF на целевую ноду без перезапуска клиентской сессии.</p>
-          </div>
-        </div>
-
-        <div class="card" style="margin-top:22px;">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div class="label">Живой журнал Автономного Оператора в Kubernetes (<code>kubectl get podlivemigrations -n boutique</code>):</div>
-            <div style="font-size:12px; color:#4ade80;" id="max_gap">Макс. задержка потока: 0 ms</div>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Имя задачи (CRD)</th>
-                <th>Мигрирующий Pod</th>
-                <th>Маршрут (Source &rarr; Target)</th>
-                <th>Причина (KEP-5823 Trigger)</th>
-                <th>Статус</th>
-                <th>Время паузы (Freeze)</th>
-              </tr>
-            </thead>
-            <tbody id="plm_body">
-              <tr><td colspan="6" style="color:#64748b;">Оператор дежурит. Выполните <code>kubectl cordon k8s-worker-1</code> для автоматического запуска миграции...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <script>
-        let lastTs = performance.now();
-        let maxGap = 0;
-        let drops = 0;
-        const evt = new EventSource('/live/stream');
-        evt.onmessage = (e) => {
-          const now = performance.now();
-          const gap = Math.round(now - lastTs);
-          if (gap > maxGap && lastTs > 0) maxGap = gap;
-          lastTs = now;
-          const d = JSON.parse(e.data);
-          document.getElementById('counter').innerText = d.ram_counter;
-          document.getElementById('pod_ip').innerText = d.pod_ip + ' (PID ' + d.pid + ')';
-          document.getElementById('redis_status').innerText = d.redis_cart;
-          document.getElementById('max_gap').innerText = 'Макс. задержка потока: ' + maxGap + ' ms';
-
-          if (d.migrations && d.migrations.length > 0) {
-            for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.add('active');
-            document.getElementById('plm_body').innerHTML = d.migrations.map(m => `
-              <tr>
-                <td>${m.name}</td>
-                <td>${m.pod}</td>
-                <td>${m.source} &rarr; ${m.target}</td>
-                <td><span style="color:#38bdf8;">${m.reason}</span></td>
-                <td style="color:#4ade80; font-weight:700;">${m.phase}</td>
-                <td>${m.freeze}</td>
-              </tr>
-            `).join('');
-          }
-        };
-        evt.onerror = () => {
-          drops++;
-          document.getElementById('tcp_status').innerText = 'RECONNECTING (drops: ' + drops + ')';
-          document.getElementById('tcp_status').style.color = '#f87171';
-        };
-      </script>
-    </body>
-    </html>
-    """
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, format, *args):
-            return
-
-        def do_GET(self):
-            if self.path.startswith("/live/stream"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
-                pod_ip = socket.gethostbyname(socket.gethostname())
-                tick = 0
-                migrations = []
-                redis_state = "CONNECTED (+PONG)"
-                while True:
-                    if tick % 10 == 0:
-                        migrations = get_k8s_migrations()
-                        redis_state = check_redis_cart()
-                    tick += 1
-                    payload = json.dumps({
-                        "ram_counter": STATE["ram_counter"],
-                        "pod_ip": pod_ip,
-                        "pid": STATE["pid"],
-                        "redis_cart": redis_state,
-                        "migrations": migrations,
-                    })
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                    time.sleep(0.1)
-            else:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(HTML_PAGE.encode("utf-8"))
-
-    if __name__ == "__main__":
-        server = http.server.ThreadingHTTPServer(("0.0.0.0", 8090), Handler)
-        server.serve_forever()
----
 apiVersion: v1
 kind: Pod
 metadata:
@@ -269,22 +14,150 @@ metadata:
   labels:
     app: live-stream
 spec:
-  serviceAccountName: live-migration-operator-sa
-  nodeSelector:
-    kubernetes.io/hostname: k8s-worker-1
+  automountServiceAccountToken: false
+  nodeName: k8s-worker-1
   containers:
-  - name: stream-server
-    image: python:3.12-slim
-    command: ["python3", "/app/server.py"]
-    ports:
-    - containerPort: 8090
-    volumeMounts:
-    - name: code
-      mountPath: /app
-  volumes:
-  - name: code
-    configMap:
-      name: live-stream-app-code
+    - name: stream-server
+      image: docker.io/library/python:3.12-slim
+      command:
+        - python3
+        - -c
+        - |
+          import http.server, json, os, socket, time
+          from threading import Thread
+
+          STATE = {
+              "ram_counter": 0,
+              "started_at": time.strftime("%H:%M:%S"),
+              "pid": os.getpid(),
+              "node": "k8s-worker-1",
+              "migrations": [],
+          }
+
+          def counter_loop():
+              while True:
+                  STATE["ram_counter"] += 1
+                  time.sleep(0.1)
+
+          Thread(target=counter_loop, daemon=True).start()
+
+          def get_current_pod_ip():
+              try:
+                  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                  s.connect(("10.10.1.10", 80))
+                  ip = s.getsockname()[0]
+                  s.close()
+                  return ip
+              except Exception:
+                  return "unknown"
+
+          HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>CRI-O + CRIU Stateful Migration</title>
+          <style>
+            body { font-family: system-ui, sans-serif; background: #0b0f19; color: #f8fafc; margin: 0; padding: 24px; }
+            .wrap { max-width: 1120px; margin: 0 auto; }
+            .top { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }
+            .top a { color: #38bdf8; text-decoration: none; font-weight: 600; background: #1e293b; padding: 8px 14px; border-radius: 8px; }
+            .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 20px; }
+            .card { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 16px; }
+            .label { font-size: 11px; color: #94a3b8; text-transform: uppercase; }
+            .val { font-size: 24px; font-weight: 700; margin-top: 6px; font-family: monospace; color: #38bdf8; }
+            .ok { color: #4ade80; }
+            .pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 20px; }
+            .step { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px; }
+            .step.active { border-color: #4ade80; background: #06281e; }
+            .step h4 { margin: 0 0 6px 0; font-size: 14px; }
+            .step p { margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.4; }
+            table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+            th, td { text-align: left; padding: 10px; border-bottom: 1px solid #1f2937; font-family: monospace; }
+          </style></head><body><div class="wrap">
+            <div class="top">
+              <div>
+                <h2 style="margin:0;">🚀 Стенд миграции состояния RAM (CRI-O + CRIU + Buildah + Cilium eBPF)</h2>
+                <p style="margin:4px 0 0; color:#94a3b8; font-size:14px;">Эталонный конвейер KEP-2008: Kubelet Checkpoint &rarr; Buildah OCI Image &rarr; CRI-O Restore на целевой ноде</p>
+              </div>
+              <a href="/">🛒 Магазин Google Boutique &rarr;</a>
+            </div>
+            <div class="grid">
+              <div class="card"><div class="label">Счетчик в памяти RAM (CRIU)</div><div class="val ok" id="counter">0</div></div>
+              <div class="card"><div class="label">Текущая физическая нода</div><div class="val ok" id="node">...</div></div>
+              <div class="card"><div class="label">Pod IP и PID</div><div class="val" id="pod_ip">...</div></div>
+              <div class="card"><div class="label">Макс. пауза клиента (HTTP Gap)</div><div class="val" id="max_gap">0 ms</div></div>
+            </div>
+            <h3 style="margin-top:24px; margin-bottom:8px; font-size:15px;">Реальный 4-этапный конвейер миграции контейнера:</h3>
+            <div class="pipeline">
+              <div class="step" id="st1"><h4>1. Kubelet Checkpoint API</h4><p>Вызов <code>POST /checkpoint</code> в CRI-O на исходной ноде. CRIU сохраняет страницы RAM в tar-архив (<code>T_dump</code>).</p></div>
+              <div class="step" id="st2"><h4>2. Buildah OCI Packaging</h4><p>Упаковка архива CRIU в OCI-образ с аннотацией <code>io.kubernetes.cri-o.annotations.checkpoint.name</code> (<code>T_build</code>).</p></div>
+              <div class="step" id="st3"><h4>3. Registry Transfer</h4><p>Передача OCI-образа чекпоинта через локальный реестр кластера на целевую ноду (<code>T_transfer</code>).</p></div>
+              <div class="step" id="st4"><h4>4. CRI-O Restore &amp; Cilium</h4><p>CRI-O распаковывает дамп через <code>criu restore</code> (счетчик RAM продолжается с момента дампа!), Cilium eBPF обновляет Endpoint (<code>T_restore</code>).</p></div>
+            </div>
+            <div class="card" style="margin-top:20px;">
+              <div class="label">Журнал оператора (<code>kubectl get podlivemigrations -n boutique</code>):</div>
+              <table><thead><tr><th>Задача</th><th>Маршрут</th><th>Триггер</th><th>Фаза</th><th>Полный пайплайн</th><th>Разбивка фаз и состояние счетчика (Dump &rarr; Kill &rarr; Restore)</th></tr></thead>
+              <tbody id="plm_body"><tr><td colspan="6" style="color:#64748b;">Ожидание триггера (например: <code>kubectl cordon k8s-worker-1</code>)...</td></tr></tbody></table>
+            </div>
+          </div>
+          <script>
+            let lastTs = performance.now(), maxGap = 0;
+            async function poll() {
+              try {
+                const r = await fetch('/live/state', { cache: 'no-store' });
+                const d = await r.json();
+                const now = performance.now(), gap = Math.round(now - lastTs);
+                if (gap > maxGap && lastTs > 0) maxGap = gap;
+                lastTs = now;
+                document.getElementById('counter').innerText = d.ram_counter;
+                document.getElementById('node').innerText = d.node;
+                document.getElementById('pod_ip').innerText = d.pod_ip + ' (PID ' + d.pid + ')';
+                document.getElementById('max_gap').innerText = maxGap + ' ms';
+                if (d.migrations && d.migrations.length > 0) {
+                  for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.add('active');
+                  document.getElementById('plm_body').innerHTML = d.migrations.map(m => `<tr><td>${m.name}</td><td>${m.source} &rarr; ${m.target}</td><td>${m.reason}</td><td style="color:#4ade80;font-weight:700;">${m.phase}</td><td>${m.downtime}</td><td>${m.breakdown}</td></tr>`).join('');
+                }
+              } catch (e) {}
+              setTimeout(poll, 200);
+            }
+            poll();
+          </script></body></html>"""
+
+          class H(http.server.BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.0"
+              def log_message(self, *a): return
+              def do_GET(self):
+                  if self.path.startswith("/live/state"):
+                      body = json.dumps({
+                          "ram_counter": STATE["ram_counter"],
+                          "node": STATE["node"],
+                          "pod_ip": get_current_pod_ip(),
+                          "pid": STATE["pid"],
+                          "migrations": STATE["migrations"],
+                      }).encode("utf-8")
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Connection", "close")
+                      self.end_headers()
+                      self.wfile.write(body)
+                  else:
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/html; charset=utf-8")
+                      self.send_header("Connection", "close")
+                      self.end_headers()
+                      self.wfile.write(HTML.encode("utf-8"))
+
+              def do_POST(self):
+                  if self.path.startswith("/live/record"):
+                      length = int(self.headers.get("Content-Length", "0"))
+                      payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                      STATE["node"] = payload.get("target", STATE["node"])
+                      STATE["migrations"].append(payload)
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Connection", "close")
+                      self.end_headers()
+                      self.wfile.write(b'{"ok":true}')
+
+          http.server.ThreadingHTTPServer(("0.0.0.0", 8090), H).serve_forever()
+      ports:
+        - containerPort: 8090
 ---
 apiVersion: v1
 kind: Service
@@ -296,6 +169,6 @@ spec:
   selector:
     app: live-stream
   ports:
-  - name: http
-    port: 8090
-    targetPort: 8090
+    - name: http
+      port: 8090
+      targetPort: 8090

@@ -1,8 +1,8 @@
 ---
 # ==============================================================================
-# PLAY 1: Подготовка всех 3 серверов (Ядро Linux 6.8+, CRIU, Containerd, Kubelet)
+# PLAY 1: Подготовка всех 3 серверов (Ядро Linux 6.8+, CRIU, CRI-O v1.31, Buildah, Kubelet)
 # ==============================================================================
-- name: "Этап 1: Настройка ядра Linux, CRIU и среды контейнеров на всех узлах"
+- name: "Этап 1: Настройка ядра Linux, CRIU, CRI-O v1.31 и Buildah на всех узлах"
   hosts: k8s_cluster
   become: true
   tasks:
@@ -14,7 +14,7 @@
       ansible.builtin.command: swapoff -a
       changed_when: false
 
-    - name: "1.3 Удаление Swap из /etc/fstab (чтобы не включался после перезагрузки)"
+    - name: "1.3 Удаление Swap из /etc/fstab"
       ansible.builtin.replace:
         path: /etc/fstab
         regexp: '^([^#].*?\sswap\s+.*)$'
@@ -36,29 +36,24 @@
         - overlay
         - br_netfilter
 
-    - name: "1.6 Тонкая настройка параметров ядра sysctl для Cilium eBPF и CRIU TCP_REPAIR"
+    - name: "1.6 Тонкая настройка параметров ядра sysctl для Cilium eBPF и CRIU"
       ansible.builtin.copy:
         dest: /etc/sysctl.d/99-k8s-criu-ebpf.conf
         mode: "0644"
         content: |
-          # Разрешаем маршрутизацию пакетов между контейнерами и нодами
           net.bridge.bridge-nf-call-iptables  = 1
           net.bridge.bridge-nf-call-ip6tables = 1
           net.ipv4.ip_forward                 = 1
-          # Отключаем строгий rp_filter, чтобы Cilium eBPF и мигрировавшие Pod IP не дропались ядром
           net.ipv4.conf.all.rp_filter         = 0
           net.ipv4.conf.default.rp_filter     = 0
-          # Разрешаем механизм userfaultfd для Lazy Post-Copy миграции памяти в CRIU
           vm.unprivileged_userfaultfd         = 1
-          # КРИТИЧНО ДЛЯ ЖИВОЙ МИГРАЦИИ TCP: разрешает ядру новой ноды подхватывать
-          # уже установленные TCP-соединения (без начального SYN-пакета)
           net.netfilter.nf_conntrack_tcp_loose = 1
 
     - name: "1.7 Применение настроек sysctl"
       ansible.builtin.command: sysctl --system
       changed_when: false
 
-    - name: "1.8 Установка системных пакетов: CRIU, crun, containerd, conntrack, nftables, bpftool"
+    - name: "1.8 Установка системных пакетов: CRIU, crun, buildah, skopeo, conntrack, bpftool"
       ansible.builtin.apt:
         update_cache: true
         name:
@@ -73,87 +68,83 @@
           - nftables
           - criu
           - crun
-          - containerd
+          - buildah
+          - skopeo
           - rsync
           - linux-tools-common
         state: present
 
-    - name: "1.9 Проверка поддержки CRIU в ядре Linux (criu check)"
-      ansible.builtin.command: criu check
-      register: criu_check_result
-      changed_when: false
-      failed_when: false
+    - name: "1.9 Настройка /etc/criu/default.conf (без tcp-established, так как на целевой ноде выдается новый Pod IP)"
+      ansible.builtin.copy:
+        dest: /etc/criu/default.conf
+        mode: "0644"
+        content: |
+          shell-job
+          ext-unix-sk
 
-    - name: "1.10 Вывод результата проверки CRIU"
-      ansible.builtin.debug:
-        msg: "Результат criu check на {{ inventory_hostname }}: {{ criu_check_result.stdout | default('OK') }}"
-
-    - name: "1.11 Создание базового конфига containerd"
-      ansible.builtin.shell: |
-        mkdir -p /etc/containerd
-        containerd config default > /etc/containerd/config.toml
-      args:
-        creates: /etc/containerd/config.toml
-
-    - name: "1.12 Включение SystemdCgroup = true в containerd (обязательно для K8s и CRIU cgroups v2)"
-      ansible.builtin.replace:
-        path: /etc/containerd/config.toml
-        regexp: 'SystemdCgroup = false'
-        replace: 'SystemdCgroup = true'
-      notify: Restart containerd
-
-    - name: "1.13 Перезапуск и включение службы containerd"
-      ansible.builtin.systemd:
-        name: containerd
-        state: restarted
-        enabled: true
-        daemon_reload: true
-
-    - name: "1.14 Добавление официального GPG-ключа репозитория Kubernetes v1.31"
+    - name: "1.10 Добавление официальных GPG-ключей Kubernetes v1.31 и CRI-O v1.31"
       ansible.builtin.shell: |
         mkdir -p -m 755 /etc/apt/keyrings
         curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        curl -fsSL https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.31/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
       args:
-        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        creates: /etc/apt/keyrings/cri-o-apt-keyring.gpg
 
-    - name: "1.15 Подключение репозитория Kubernetes v1.31"
+    - name: "1.11 Подключение официальных репозиториев Kubernetes v1.31 и CRI-O v1.31"
       ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/kubernetes.list
-        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /\n"
+        dest: /etc/apt/sources.list.d/kubernetes-crio.list
         mode: "0644"
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /
+          deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.31/deb/ /
 
-    - name: "1.16 Установка kubelet, kubeadm и kubectl"
+    - name: "1.12 Установка эталонного рантайма CRI-O v1.31 и Kubernetes (kubelet, kubeadm, kubectl)"
       ansible.builtin.apt:
         update_cache: true
         name:
+          - cri-o
           - kubelet
           - kubeadm
           - kubectl
         state: present
 
-    - name: "1.17 Включение Feature Gate ContainerCheckpoint=true в kubelet"
+    - name: "1.13 Включение поддержки CRIU Checkpoint/Restore в CRI-O (/etc/crio/crio.conf.d/10-criu.conf)"
       ansible.builtin.copy:
-        dest: /etc/default/kubelet
-        content: 'KUBELET_EXTRA_ARGS="--feature-gates=ContainerCheckpoint=true"'
+        dest: /etc/crio/crio.conf.d/10-criu.conf
         mode: "0644"
+        content: |
+          [crio.runtime]
+          enable_criu_support = true
+          default_runtime = "crun"
 
-    - name: "1.18 Перезагрузка конфигурации systemd для kubelet"
+    - name: "1.14 Разрешение локального HTTP-реестра (10.10.1.10:5000) для пересылки OCI-образов чекпоинтов"
+      ansible.builtin.copy:
+        dest: /etc/containers/registries.conf.d/99-local-checkpoint-registry.conf
+        mode: "0644"
+        content: |
+          [[registry]]
+          location = "10.10.1.10:5000"
+          insecure = true
+
+    - name: "1.15 Запуск и включение служб cri-o и kubelet"
       ansible.builtin.systemd:
-        name: kubelet
+        name: "{{ item }}"
+        state: restarted
         enabled: true
         daemon_reload: true
+      loop:
+        - crio
+        - kubelet
 
-  handlers:
-    - name: Restart containerd
-      ansible.builtin.systemd:
-        name: containerd
-        state: restarted
+    - name: "1.16 Предварительная загрузка базового образа python:3.12-slim во все узлы CRI-O (обязательно для CRI-O Restore на worker-2)"
+      ansible.builtin.command: crictl pull docker.io/library/python:3.12-slim
+      changed_when: false
 
 
 # ==============================================================================
-# PLAY 2: Инициализация Control Plane и установка Cilium Service Mesh (eBPF)
+# PLAY 2: Инициализация Control Plane, установка Cilium Service Mesh и OCI Registry
 # ==============================================================================
-- name: "Этап 2: Инициализация Kubernetes Master и развертывание Cilium Service Mesh (eBPF)"
+- name: "Этап 2: Инициализация Kubernetes Master (CRI-O) и развертывание Cilium Service Mesh (eBPF)"
   hosts: master
   become: true
   tasks:
@@ -162,11 +153,12 @@
         path: /etc/kubernetes/admin.conf
       register: k8s_admin_conf
 
-    - name: "2.2 Запуск kubeadm init (без стандартного kube-proxy — его заменит Cilium eBPF)"
+    - name: "2.2 Запуск kubeadm init с рантаймом CRI-O (без kube-proxy — его заменяет Cilium eBPF)"
       ansible.builtin.command: >
         kubeadm init
         --apiserver-advertise-address={{ private_ip }}
         --pod-network-cidr=10.244.0.0/16
+        --cri-socket=unix:///var/run/crio/crio.sock
         --skip-phases=addon/kube-proxy
       when: not k8s_admin_conf.stat.exists
 
@@ -193,7 +185,7 @@
       failed_when: false
       changed_when: false
 
-    - name: "2.6 Установка Cilium Service Mesh с eBPF, Cilium Ingress Controller и Hubble"
+    - name: "2.6 Установка Cilium Service Mesh с eBPF (синхронизирован пул 10.244.0.0/16)"
       become: false
       ansible.builtin.command: >
         cilium install
@@ -201,6 +193,7 @@
         --set kubeProxyReplacement=true
         --set k8sServiceHost={{ private_ip }}
         --set k8sServicePort=6443
+        --set ipam.operator.clusterPoolIPv4PodCIDRList=10.244.0.0/16
         --set bpf.masquerade=true
         --set l7Proxy=true
         --set ingressController.enabled=true
@@ -213,43 +206,37 @@
         --set hubble.ui.enabled=true
       when: cilium_ds.rc != 0
 
-    - name: "2.7 Генерация токена присоединения (join command) для Worker-нод"
+    - name: "2.7 Генерация команды присоединения (join command) для Worker-нод"
       ansible.builtin.command: kubeadm token create --print-join-command
       register: join_command_raw
       changed_when: false
 
-    - name: "2.8 Сохранение команды подключения воркеров в общую переменную Ansible"
+    - name: "2.8 Сохранение команды подключения воркеров (с указанием сокета CRI-O)"
       ansible.builtin.set_fact:
-        k8s_join_command: "{{ join_command_raw.stdout }}"
+        k8s_join_command: "{{ join_command_raw.stdout }} --cri-socket=unix:///var/run/crio/crio.sock"
 
 
 # ==============================================================================
-# PLAY 3: Присоединение Worker-нод и финальная проверка Cilium eBPF
+# PLAY 3: Присоединение Worker-нод и выдача сертификата для Kubelet Checkpoint API
 # ==============================================================================
 - name: "Этап 3: Подключение k8s-worker-1 и k8s-worker-2 к кластеру"
   hosts: workers
   become: true
   tasks:
-    - name: "3.1 Настройка /etc/criu/default.conf (разрешение tcp-established для CRIU)"
-      ansible.builtin.copy:
-        dest: /etc/criu/default.conf
-        mode: "0644"
-        content: |
-          tcp-established
-          shell-job
-          ext-unix-sk
-
-    - name: "3.2 Проверка, подключен ли уже воркер к кластеру"
+    - name: "3.1 Проверка, подключен ли уже воркер к кластеру"
       ansible.builtin.stat:
         path: /etc/kubernetes/kubelet.conf
       register: kubelet_conf
 
-    - name: "3.3 Присоединение воркера к кластеру (kubeadm join)"
+    - name: "3.2 Присоединение воркера к кластеру (kubeadm join через CRI-O)"
       ansible.builtin.command: "{{ hostvars['k8s-master'].k8s_join_command }}"
       when: not kubelet_conf.stat.exists
 
 
-- name: "Этап 4: Установка cert-manager (Let's Encrypt SSL), 11 микросервисов Google и монитора живой миграции"
+# ==============================================================================
+# PLAY 4: Развертывание локального OCI-реестра чекпоинтов, cert-manager и манифестов
+# ==============================================================================
+- name: "Этап 4: Запуск OCI Registry, cert-manager, 11 микросервисов и CRI-O/Buildah Оператора"
   hosts: master
   become: false
   tasks:
@@ -262,9 +249,8 @@
         url: "https://www.duckdns.org/update?domains={{ duckdns_domain }}&token={{ duckdns_token }}&ip={{ master_public_ip }}"
         return_content: true
       when: duckdns_token | length > 0
-      register: duckdns_resp
 
-    - name: "4.3 Установка cert-manager (автоматический выпуск HTTPS-сертификатов Let's Encrypt для Cilium Ingress)"
+    - name: "4.3 Установка cert-manager (Let's Encrypt SSL для Cilium Ingress)"
       ansible.builtin.command: >
         kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
       changed_when: false
@@ -274,13 +260,19 @@
         kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=180s
       changed_when: false
 
-    - name: "4.5 Копирование манифестов 11 микросервисов Google и Live-Stream монитора на мастер"
+    - name: "4.5 Копирование манифестов и скриптов бенчмарка на мастер"
       ansible.builtin.copy:
         src: "../manifests/"
         dest: "/home/ubuntu/manifests/"
         mode: "0644"
 
-    - name: "4.6 Развертывание 11 микросервисов Google, монитора, Cilium Ingress и Оператора (kind: PodLiveMigration)"
+    - name: "4.5b Копирование скрипта замеров (benchmark_migration.py) на мастер"
+      ansible.builtin.copy:
+        src: "../scripts/"
+        dest: "/home/ubuntu/scripts/"
+        mode: "0755"
+
+    - name: "4.6 Развертывание всех манифестов (Cert-Manager, Boutique, Live-Demo, Ingress, CRI-O Operator)"
       ansible.builtin.shell: |
         kubectl apply -f /home/ubuntu/manifests/01-cert-manager-issuer.yaml
         kubectl apply -f /home/ubuntu/manifests/02-google-online-boutique.yaml
@@ -289,13 +281,14 @@
         kubectl apply -f /home/ubuntu/manifests/05-live-migration-operator.yaml
       changed_when: false
 
-    - name: "4.6 Вывод списка узлов и запущенных микросервисов"
+    - name: "4.7 Вывод списка узлов, подов и проверка пула Cilium (cluster-pool)"
       ansible.builtin.shell: |
+        cilium config view | grep cluster-pool
         kubectl get nodes -o wide
         kubectl get pods -n boutique -o wide
       register: nodes_out
       changed_when: false
 
-    - name: "4.7 Статус кластера Kubernetes + Cilium eBPF + 11 микросервисов"
+    - name: "4.8 Статус кластера"
       ansible.builtin.debug:
         msg: "{{ nodes_out.stdout_lines }}"

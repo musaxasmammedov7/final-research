@@ -17,9 +17,9 @@ variable "master_instance_type" {
 }
 
 variable "worker_instance_type" {
-  description = "Тип EC2 инстанса для Worker нод (8 GB RAM для Cilium Service Mesh + CRIU + 10 микросервисов)"
+  description = "Тип EC2 инстанса для Worker нод (m6i.large — выделенные ресурсы CPU без троттлинга CPU-кредитов t3 для точных бенчмарков)"
   type        = string
-  default     = "t3.large"
+  default     = "m6i.large"
 }
 
 variable "allowed_ssh_cidr" {
