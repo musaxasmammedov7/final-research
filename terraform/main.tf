@@ -121,28 +121,12 @@ resource "aws_security_group" "k8s_sg" {
     self        = true
   }
 
-  # SSH доступ
+  # Внешний доступ ТОЛЬКО по SSH (порт 22 по RSA-ключу 4096 бит).
+  # Все внутренние сервисы, K8s API и Hubble UI пробрасываются через защищенный SSH-туннель (Zero-Trust).
   ingress {
-    description = "SSH access"
+    description = "SSH access only"
     from_port   = 22
     to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_ssh_cidr]
-  }
-
-  # Kubernetes API Server (6443) и NodePort диапазон для демо-тестов (30000-32767)
-  ingress {
-    description = "Kubernetes API and NodePorts for Demo"
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_ssh_cidr]
-  }
-
-  ingress {
-    description = "NodePort Services for Live Migration Demo"
-    from_port   = 30000
-    to_port     = 32767
     protocol    = "tcp"
     cidr_blocks = [var.allowed_ssh_cidr]
   }
