@@ -55,9 +55,5 @@ final-research/
 ├── ansible/                    # Конфигурация серверов через Ansible (IaC)
 │   ├── ansible.cfg
 │   └── site.yml                # Playbook: ядро, CRIU, containerd, K8s v1.31 и Cilium Service Mesh
-├── scripts/                    # Альтернативные bash-скрипты и утилиты тестирования
-│   ├── 01-prepare-node.sh
-│   ├── 02-init-cluster-and-cilium.sh
-│   └── bootstrap-all.sh
 └── README.md
 ```

@@ -208,7 +208,7 @@ resource "aws_instance" "k8s_workers" {
   }
 }
 
-# 7. Автоматическая генерация inventory.ini для Ansible и env-файла
+# 7. Автоматическая генерация inventory.ini для Ansible
 resource "local_file" "ansible_inventory" {
   content = <<-EOT
     [master]
@@ -233,17 +233,4 @@ resource "local_file" "ansible_inventory" {
   file_permission = "0644"
 }
 
-resource "local_file" "cluster_env" {
-  content = <<-EOT
-    export SSH_KEY="${abspath("${path.module}/k8s-research-key.pem")}"
-    export MASTER_PUBLIC_IP="${aws_instance.k8s_master.public_ip}"
-    export MASTER_PRIVATE_IP="${aws_instance.k8s_master.private_ip}"
-    export WORKER1_PUBLIC_IP="${aws_instance.k8s_workers[0].public_ip}"
-    export WORKER1_PRIVATE_IP="${aws_instance.k8s_workers[0].private_ip}"
-    export WORKER2_PUBLIC_IP="${aws_instance.k8s_workers[1].public_ip}"
-    export WORKER2_PRIVATE_IP="${aws_instance.k8s_workers[1].private_ip}"
-  EOT
-  filename        = "${path.module}/cluster_ips.env"
-  file_permission = "0644"
-}
 
