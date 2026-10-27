@@ -2,7 +2,7 @@
 # Cilium Service Mesh Ingress + Автоматический Let's Encrypt HTTPS сертификат
 # Маршрутизирует:
 #   https://<ВАШ_ДОМЕН>/      -> 11 микросервисов Google Online Boutique (frontend)
-#   https://<ВАШ_ДОМЕН>/live  -> Живой монитор миграции TCP-потока и RAM
+#   https://<ВАШ_ДОМЕН>/live  -> Живой монитор миграции состояния RAM (CRI-O + CRIU + Buildah)
 # ==============================================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress

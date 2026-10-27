@@ -355,9 +355,9 @@ spec:
     port: 7070
     targetPort: 7070
 ---
-# STATEFUL TARGET 1: Корзина товаров в оперативной памяти (redis-cart)
-# При обычном kubectl drain корзина всех покупателей стирается,
-# а при нашей живой миграции CRIU + Cilium eBPF остается нетронутой!
+# In-memory Redis хранилище корзины Google Online Boutique (redis-cart)
+# Также используется в scripts/benchmark_migration.py как Baseline 2 (Redis-репликация состояния)
+# для сравнения с прозрачной миграцией памяти контейнера через CRI-O + CRIU (live-stream-pod).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -168,7 +168,7 @@ resource "aws_instance" "k8s_master" {
   key_name               = aws_key_pair.research_key.key_name
   private_ip             = "10.10.1.10"
 
-  # ВАЖНО: Отключаем Source/Destination Check для бесшовной маршрутизации Cilium и миграции IP подов
+  # ВАЖНО: Отключаем Source/Destination Check для маршрутизации Cilium eBPF между узлами кластера
   source_dest_check = false
 
   root_block_device {
@@ -193,7 +193,7 @@ resource "aws_instance" "k8s_workers" {
   key_name               = aws_key_pair.research_key.key_name
   private_ip             = "10.10.1.${21 + count.index}"
 
-  # ВАЖНО: Отключаем Source/Destination Check для живой миграции Pod IP между воркерами
+  # ВАЖНО: Отключаем Source/Destination Check для маршрутизации Cilium eBPF между узлами кластера
   source_dest_check = false
 
   root_block_device {

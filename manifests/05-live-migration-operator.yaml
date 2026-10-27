@@ -230,7 +230,7 @@ data:
 
         pods = k8s_request("/api/v1/namespaces/boutique/pods").get("items", [])
         existing_plms = k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations").get("items", [])
-        active_pods = {p["spec"]["podName"] for p in existing_plms if p.get("status", {}).get("phase") == "Migrating"}
+        active_pods = {p["spec"]["podName"] for p in existing_plms if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")}
 
         for pod in pods:
             pod_name = pod["metadata"]["name"]
@@ -262,6 +262,7 @@ data:
     def execute_migration_pipeline(ns, plm_name, pod_name, src_node, dst_node, reason):
         update_status(ns, plm_name, "Migrating", "-", "Step 1/4: Kubelet CRIU Checkpoint", f"[{reason}] Starting CRI-O checkpoint")
         token = get_token()
+        ckpt_image = f"10.10.1.10:5000/stream-server-checkpoint:{plm_name}"
 
         src_pod = k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}")
         src_pod_ip = src_pod.get("status", {}).get("podIP")
@@ -281,8 +282,13 @@ data:
         TAR_FILE=$(ls -t /var/lib/kubelet/checkpoints/checkpoint-{pod_name}_{ns}-stream-server-*.tar | head -n 1)
         CID=$(buildah from scratch)
         buildah add "$CID" "$TAR_FILE" /
+        MNT=$(buildah mount "$CID")
+        if [ -f "$MNT/config.dump" ]; then
+          python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["rootfsImageName"]="docker.io/library/python:3.12-slim"; json.dump(d,open(p,"w"))' "$MNT/config.dump"
+        fi
+        buildah umount "$CID"
         buildah config --annotation=io.kubernetes.cri-o.annotations.checkpoint.name=stream-server "$CID"
-        buildah commit "$CID" {REGISTRY_IMAGE}
+        buildah commit "$CID" {ckpt_image}
         buildah rm "$CID"
         """
         host_cmd(build_script)
@@ -291,7 +297,7 @@ data:
 
         # ШАГ 3: Отправка OCI-образа чекпоинта во внутренний HTTP-реестр кластера (tls-verify=false)
         update_status(ns, plm_name, "Migrating", "-", f"Dump={dump_ms}ms, Build={build_ms}ms | Step 3/4: Push", "Pushing OCI checkpoint image")
-        host_cmd(f"buildah push --tls-verify=false {REGISTRY_IMAGE}")
+        host_cmd(f"buildah push --tls-verify=false {ckpt_image}")
         t3 = time.monotonic()
         push_ms = int((t3 - t2) * 1000)
 
@@ -316,9 +322,10 @@ data:
             "spec": {
                 "automountServiceAccountToken": False,
                 "nodeName": dst_node,
+                "tolerations": [{"operator": "Exists"}],
                 "containers": [{
                     "name": "stream-server",
-                    "image": REGISTRY_IMAGE,
+                    "image": ckpt_image,
                     "imagePullPolicy": "Always",
                     "ports": [{"containerPort": 8090}],
                 }],
@@ -338,6 +345,9 @@ data:
                     counter_at_restore = c_val
                     break
             time.sleep(0.05)
+
+        if counter_at_restore is None:
+            raise RuntimeError(f"CRI-O restore or HTTP 200 verification failed on {dst_node}")
 
         t4 = time.monotonic()
         restore_ms = int((t4 - t3) * 1000)

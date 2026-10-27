@@ -68,6 +68,7 @@
           - nftables
           - criu
           - crun
+          - runc
           - buildah
           - skopeo
           - rsync
@@ -98,24 +99,43 @@
           deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /
           deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.31/deb/ /
 
-    - name: "1.12 Установка эталонного рантайма CRI-O v1.31 и Kubernetes (kubelet, kubeadm, kubectl)"
+    - name: "1.12 Установка эталонного рантайма CRI-O v1.31 и Kubernetes (kubelet, kubeadm, kubectl, cri-tools)"
       ansible.builtin.apt:
         update_cache: true
         name:
           - cri-o
+          - cri-tools
           - kubelet
           - kubeadm
           - kubectl
         state: present
 
-    - name: "1.13 Включение поддержки CRIU Checkpoint/Restore в CRI-O (/etc/crio/crio.conf.d/10-criu.conf)"
-      ansible.builtin.copy:
-        dest: /etc/crio/crio.conf.d/10-criu.conf
-        mode: "0644"
-        content: |
-          [crio.runtime]
-          enable_criu_support = true
-          default_runtime = "crun"
+    - name: "1.13 Включение поддержки CRIU Checkpoint/Restore в CRI-O (/etc/crio/crio.conf.d/99-criu.conf)"
+      ansible.builtin.shell: |
+        if [ -x /usr/libexec/crio/crun ] && /usr/libexec/crio/crun --version 2>/dev/null | grep -qi criu; then
+          OCI_RT="crun"
+          OCI_PATH="/usr/libexec/crio/crun"
+        elif crun --version 2>/dev/null | grep -qi criu; then
+          OCI_RT="crun"
+          OCI_PATH=$(command -v crun)
+        elif [ -x /usr/libexec/crio/runc ]; then
+          OCI_RT="runc"
+          OCI_PATH="/usr/libexec/crio/runc"
+        else
+          OCI_RT="runc"
+          OCI_PATH=$(command -v runc)
+        fi
+        cat <<EOF > /etc/crio/crio.conf.d/99-criu.conf
+        [crio.runtime]
+        enable_criu_support = true
+        default_runtime = "${OCI_RT}"
+
+        [crio.runtime.runtimes.${OCI_RT}]
+        runtime_path = "${OCI_PATH}"
+        runtime_type = "oci"
+        runtime_root = "/run/${OCI_RT}"
+        EOF
+      changed_when: false
 
     - name: "1.14 Разрешение локального HTTP-реестра (10.10.1.10:5000) для пересылки OCI-образов чекпоинтов"
       ansible.builtin.copy:
@@ -125,6 +145,15 @@
           [[registry]]
           location = "10.10.1.10:5000"
           insecure = true
+
+    - name: "1.14b Настройка /etc/crictl.yaml для работы crictl напрямую с сокетом CRI-O"
+      ansible.builtin.copy:
+        dest: /etc/crictl.yaml
+        mode: "0644"
+        content: |
+          runtime-endpoint: unix:///var/run/crio/crio.sock
+          image-endpoint: unix:///var/run/crio/crio.sock
+          timeout: 30
 
     - name: "1.15 Запуск и включение служб cri-o и kubelet"
       ansible.builtin.systemd:
@@ -193,7 +222,7 @@
         --set kubeProxyReplacement=true
         --set k8sServiceHost={{ private_ip }}
         --set k8sServicePort=6443
-        --set ipam.operator.clusterPoolIPv4PodCIDRList=10.244.0.0/16
+        --set ipam.operator.clusterPoolIPv4PodCIDRList="{10.244.0.0/16}"
         --set bpf.masquerade=true
         --set l7Proxy=true
         --set ingressController.enabled=true
@@ -279,6 +308,13 @@
         kubectl apply -f /home/ubuntu/manifests/03-live-migration-stream-demo.yaml
         kubectl apply -f /home/ubuntu/manifests/04-cilium-ingress-https.yaml
         kubectl apply -f /home/ubuntu/manifests/05-live-migration-operator.yaml
+      changed_when: false
+
+    - name: "4.6b Ожидание готовности реестра чекпоинтов, демонстрационного пода и оператора"
+      ansible.builtin.shell: |
+        kubectl wait --for=condition=Available deployment/checkpoint-registry -n boutique --timeout=180s
+        kubectl wait --for=condition=Ready pod/live-stream-pod -n boutique --timeout=180s
+        kubectl wait --for=condition=Available deployment/redis-cart -n boutique --timeout=180s
       changed_when: false
 
     - name: "4.7 Вывод списка узлов, подов и проверка пула Cilium (cluster-pool)"

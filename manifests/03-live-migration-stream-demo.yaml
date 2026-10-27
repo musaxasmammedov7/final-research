@@ -16,6 +16,8 @@ metadata:
 spec:
   automountServiceAccountToken: false
   nodeName: k8s-worker-1
+  tolerations:
+    - operator: Exists
   containers:
     - name: stream-server
       image: docker.io/library/python:3.12-slim
