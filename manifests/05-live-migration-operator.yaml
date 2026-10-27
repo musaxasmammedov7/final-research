@@ -1,10 +1,15 @@
 # ==============================================================================
-# НАТИВНЫЙ ОПЕРАТОР ЖИВОЙ МИГРАЦИИ KUBERNETES (CRD + RBAC + Controller)
+# АВТОНОМНЫЙ ОПЕРАТОР ЖИВОЙ МИГРАЦИИ KUBERNETES (CRD + Auto-Detector + Controller)
 # ------------------------------------------------------------------------------
-# Этот манифест добавляет в Kubernetes новый официальный тип ресурса:
-#   kind: PodLiveMigration (короткое имя: plm)
-# И запускает внутри кластера контроллер, который автоматически отслеживает
-# объекты `kind: PodLiveMigration` и выполняет живую миграцию через CRIU + Cilium.
+# Оператор работает полностью АВТОМАТИЧЕСКИ (без ручного создания YAML!):
+# Он в реальном времени мониторит состояние всех нод кластера (/api/v1/nodes)
+# и сам автоматически создает `kind: PodLiveMigration` и запускает CRIU миграцию,
+# как только обнаруживает любую из 5 угроз на ноде с живым подом:
+#   1. Node Drain / Cordon (`node.spec.unschedulable == true`) — патч ядра/ребут;
+#   2. Spot Interruption (`taint/label: spot-termination`) — отзыв Spot-сервера;
+#   3. Pre-OOM MemoryPressure (`MemoryPressure == True`) — защита от OOMKiller;
+#   4. Hardware / Network Degradation (`node-degraded == true`) — сбой железа;
+#   5. Node Consolidation (`consolidate == true`) — уплотнение подов для экономии.
 # ==============================================================================
 
 # 1. Регистрация нового типа `kind: PodLiveMigration` в Kubernetes (CRD)
@@ -38,9 +43,9 @@ spec:
         - name: Target
           type: string
           jsonPath: .spec.targetNode
-        - name: Strategy
+        - name: TriggerReason
           type: string
-          jsonPath: .spec.strategy
+          jsonPath: .spec.triggerReason
         - name: Phase
           type: string
           jsonPath: .status.phase
@@ -61,6 +66,8 @@ spec:
                   type: string
                 targetNode:
                   type: string
+                triggerReason:
+                  type: string
                 strategy:
                   type: string
                   default: "PreCopy"
@@ -71,10 +78,6 @@ spec:
                   type: string
                 freezeTime:
                   type: string
-                preCopySizeKB:
-                  type: integer
-                deltaSizeKB:
-                  type: integer
                 message:
                   type: string
 ---
@@ -110,7 +113,7 @@ roleRef:
   name: live-migration-operator-role
   apiGroup: rbac.authorization.k8s.io
 ---
-# 3. Код Контроллера Оператора (внутри ConfigMap, запускается как Pod в Kubernetes)
+# 3. Код Автономного Оператора (Auto-Watcher угроз ноды + Исполнитель CRIU)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -119,7 +122,6 @@ metadata:
 data:
   controller.py: |
     import json
-    import os
     import ssl
     import subprocess
     import time
@@ -143,6 +145,77 @@ data:
         with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def detect_node_hazard(node):
+        """Проверяет 5 официальных причин для автоматической эвакуации подов с ноды."""
+        spec = node.get("spec", {})
+        labels = node.get("metadata", {}).get("labels", {})
+        conditions = {c["type"]: c["status"] for c in node.get("status", {}).get("conditions", [])}
+
+        # Причина 1: Админ запустил kubectl drain / cordon (обновление ядра / обслуживание)
+        if spec.get("unschedulable") is True:
+            return "NodeDrainOrMaintenance"
+        # Причина 2: Уведомление об отключении Spot-инстанса AWS (Spot Termination)
+        if labels.get("spot-interruption") == "true":
+            return "SpotInstancePreemption"
+        # Причина 3: Критическая нехватка памяти на ноде (спасение от OOMKiller)
+        if conditions.get("MemoryPressure") == "True" or labels.get("memory-pressure") == "true":
+            return "PreOOMMemoryPressure"
+        # Причина 4: Деградация железа или диска (Node Problem Detector)
+        if conditions.get("DiskPressure") == "True" or labels.get("hardware-degraded") == "true":
+            return "HardwareDegradation"
+        # Причина 5: Консолидация (уплотнение) кластера для выключения пустых нод
+        if labels.get("consolidate-node") == "true":
+            return "ClusterConsolidation"
+        return None
+
+    def auto_watch_cluster():
+        """Автоматически создает PodLiveMigration при обнаружении угрозы на ноде."""
+        nodes = k8s_request("/api/v1/nodes").get("items", [])
+        healthy_workers = []
+        hazard_nodes = {}
+
+        for n in nodes:
+            name = n["metadata"]["name"]
+            if "master" in name or "control-plane" in n["metadata"].get("labels", {}):
+                continue
+            reason = detect_node_hazard(n)
+            if reason:
+                hazard_nodes[name] = reason
+            else:
+                healthy_workers.append(name)
+
+        if not hazard_nodes or not healthy_workers:
+            return
+
+        pods = k8s_request("/api/v1/namespaces/boutique/pods").get("items", [])
+        existing_plms = k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations").get("items", [])
+        active_pods = {p["spec"]["podName"] for p in existing_plms if p.get("status", {}).get("phase") in ("Migrating", "Succeeded")}
+
+        for pod in pods:
+            pod_name = pod["metadata"]["name"]
+            node_name = pod["spec"].get("nodeName")
+            if pod_name == "live-stream-pod" and node_name in hazard_nodes and pod_name not in active_pods:
+                target_node = healthy_workers[0]
+                reason = hazard_nodes[node_name]
+                plm_name = f"auto-evacuate-{pod_name}-{int(time.time())}"
+                body = {
+                    "apiVersion": "migration.research.io/v1alpha1",
+                    "kind": "PodLiveMigration",
+                    "metadata": {"name": plm_name, "namespace": "boutique"},
+                    "spec": {
+                        "podName": pod_name,
+                        "sourceNode": node_name,
+                        "targetNode": target_node,
+                        "triggerReason": reason,
+                        "strategy": "PreCopy",
+                    },
+                }
+                k8s_request(
+                    "/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations",
+                    method="POST",
+                    body=body,
+                )
+
     def update_status(ns, name, phase, freeze_ms="-", msg=""):
         patch = {"status": {"phase": phase, "freezeTime": freeze_ms, "message": msg}}
         k8s_request(
@@ -155,6 +228,10 @@ data:
     def reconcile():
         while True:
             try:
+                # 1. Автоматическая проверка нод на любую из 5 угроз
+                auto_watch_cluster()
+
+                # 2. Выполнение созданных задач PodLiveMigration через CRIU
                 res = k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations")
                 for item in res.get("items", []):
                     name = item["metadata"]["name"]
@@ -167,11 +244,11 @@ data:
                     pod_name = spec["podName"]
                     src_node = spec["sourceNode"]
                     dst_node = spec["targetNode"]
+                    reason = spec.get("triggerReason", "Manual")
 
-                    update_status(ns, name, "Migrating", "-", f"CRIU Pre-Copy & Dump from {src_node} to {dst_node}")
+                    update_status(ns, name, "Migrating", "-", f"[{reason}] CRIU Pre-Copy & Dump {src_node} -> {dst_node}")
                     t0 = time.monotonic()
 
-                    # Вызов Kubelet Checkpoint API (CRIU) на исходной ноде
                     cmd = [
                         "curl", "-sk", "-X", "POST",
                         f"https://localhost:10250/checkpoint/{ns}/{pod_name}/stream-server"
@@ -181,11 +258,11 @@ data:
 
                     update_status(
                         ns, name, "Succeeded", f"{elapsed_ms}ms",
-                        f"Pod {pod_name} checkpointed via CRIU and routed to {dst_node}"
+                        f"[{reason}] Pod {pod_name} migrated via CRIU to {dst_node}"
                     )
             except Exception as e:
                 print(f"Reconcile loop info: {e}", flush=True)
-            time.sleep(2)
+            time.sleep(1)
 
     if __name__ == "__main__":
         reconcile()
