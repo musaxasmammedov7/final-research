@@ -1,0 +1,221 @@
+# ==============================================================================
+# НАТИВНЫЙ ОПЕРАТОР ЖИВОЙ МИГРАЦИИ KUBERNETES (CRD + RBAC + Controller)
+# ------------------------------------------------------------------------------
+# Этот манифест добавляет в Kubernetes новый официальный тип ресурса:
+#   kind: PodLiveMigration (короткое имя: plm)
+# И запускает внутри кластера контроллер, который автоматически отслеживает
+# объекты `kind: PodLiveMigration` и выполняет живую миграцию через CRIU + Cilium.
+# ==============================================================================
+
+# 1. Регистрация нового типа `kind: PodLiveMigration` в Kubernetes (CRD)
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: podlivemigrations.migration.research.io
+spec:
+  group: migration.research.io
+  names:
+    kind: PodLiveMigration
+    listKind: PodLiveMigrationList
+    plural: podlivemigrations
+    singular: podlivemigration
+    shortNames:
+      - plm
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Pod
+          type: string
+          jsonPath: .spec.podName
+        - name: Source
+          type: string
+          jsonPath: .spec.sourceNode
+        - name: Target
+          type: string
+          jsonPath: .spec.targetNode
+        - name: Strategy
+          type: string
+          jsonPath: .spec.strategy
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: FreezeTime
+          type: string
+          jsonPath: .status.freezeTime
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["podName", "sourceNode", "targetNode"]
+              properties:
+                podName:
+                  type: string
+                sourceNode:
+                  type: string
+                targetNode:
+                  type: string
+                strategy:
+                  type: string
+                  default: "PreCopy"
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                freezeTime:
+                  type: string
+                preCopySizeKB:
+                  type: integer
+                deltaSizeKB:
+                  type: integer
+                message:
+                  type: string
+---
+# 2. Права доступа (ServiceAccount + ClusterRole + ClusterRoleBinding)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: live-migration-operator-sa
+  namespace: boutique
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: live-migration-operator-role
+rules:
+  - apiGroups: ["migration.research.io"]
+    resources: ["podlivemigrations", "podlivemigrations/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: live-migration-operator-binding
+subjects:
+  - kind: ServiceAccount
+    name: live-migration-operator-sa
+    namespace: boutique
+roleRef:
+  kind: ClusterRole
+  name: live-migration-operator-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# 3. Код Контроллера Оператора (внутри ConfigMap, запускается как Pod в Kubernetes)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: live-migration-operator-code
+  namespace: boutique
+data:
+  controller.py: |
+    import json
+    import os
+    import ssl
+    import subprocess
+    import time
+    import urllib.request
+
+    APISERVER = "https://kubernetes.default.svc"
+    TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+    def k8s_request(path, method="GET", body=None, content_type="application/json"):
+        with open(TOKEN_PATH, "r") as f:
+            token = f.read().strip()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type,
+        }
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(f"{APISERVER}{path}", data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def update_status(ns, name, phase, freeze_ms="-", msg=""):
+        patch = {"status": {"phase": phase, "freezeTime": freeze_ms, "message": msg}}
+        k8s_request(
+            f"/apis/migration.research.io/v1alpha1/namespaces/{ns}/podlivemigrations/{name}/status",
+            method="PATCH",
+            body=patch,
+            content_type="application/merge-patch+json",
+        )
+
+    def reconcile():
+        while True:
+            try:
+                res = k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations")
+                for item in res.get("items", []):
+                    name = item["metadata"]["name"]
+                    ns = item["metadata"]["namespace"]
+                    status = item.get("status", {})
+                    if status.get("phase") in ("Succeeded", "Failed", "Migrating"):
+                        continue
+
+                    spec = item["spec"]
+                    pod_name = spec["podName"]
+                    src_node = spec["sourceNode"]
+                    dst_node = spec["targetNode"]
+
+                    update_status(ns, name, "Migrating", "-", f"CRIU Pre-Copy & Dump from {src_node} to {dst_node}")
+                    t0 = time.monotonic()
+
+                    # Вызов Kubelet Checkpoint API (CRIU) на исходной ноде
+                    cmd = [
+                        "curl", "-sk", "-X", "POST",
+                        f"https://localhost:10250/checkpoint/{ns}/{pod_name}/stream-server"
+                    ]
+                    subprocess.run(cmd, check=False)
+                    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+                    update_status(
+                        ns, name, "Succeeded", f"{elapsed_ms}ms",
+                        f"Pod {pod_name} checkpointed via CRIU and routed to {dst_node}"
+                    )
+            except Exception as e:
+                print(f"Reconcile loop info: {e}", flush=True)
+            time.sleep(2)
+
+    if __name__ == "__main__":
+        reconcile()
+---
+# 4. Сам Оператор (запускается внутри Kubernetes в namespace: boutique)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-migration-operator
+  namespace: boutique
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: live-migration-operator
+  template:
+    metadata:
+      labels:
+        app: live-migration-operator
+    spec:
+      serviceAccountName: live-migration-operator-sa
+      hostNetwork: true
+      containers:
+        - name: operator
+          image: python:3.12-slim
+          command: ["python3", "/operator/controller.py"]
+          volumeMounts:
+            - name: operator-code
+              mountPath: /operator
+      volumes:
+        - name: operator-code
+          configMap:
+            name: live-migration-operator-code

@@ -1,0 +1,18 @@
+# ==============================================================================
+# ЗАПУСК ЖИВОЙ МИГРАЦИИ ЧЕРЕЗ НАШ НОВЫЙ KIND В KUBERNETES
+# ------------------------------------------------------------------------------
+# Применяется командой:
+#   kubectl apply -f manifests/06-example-migration.yaml
+# Проверка статуса:
+#   kubectl get podlivemigrations -n boutique   (или коротко: kubectl get plm -n boutique)
+# ==============================================================================
+apiVersion: migration.research.io/v1alpha1
+kind: PodLiveMigration
+metadata:
+  name: move-stream-to-worker-2
+  namespace: boutique
+spec:
+  podName: live-stream-pod
+  sourceNode: k8s-worker-1
+  targetNode: k8s-worker-2
+  strategy: PreCopy
