@@ -74,6 +74,7 @@
           - criu
           - crun
           - containerd
+          - rsync
           - linux-tools-common
         state: present
 
@@ -225,7 +226,7 @@
 # ==============================================================================
 # PLAY 3: Присоединение Worker-нод и финальная проверка Cilium eBPF
 # ==============================================================================
-- name: "Этап 3: Подключение k8s-worker-1 и k8s-worker-2 к кластеру"
+- name: "Этап 3: Подключение k8s-worker-1 и k8s-worker-2 к кластеру и запуск CRIU Оператора"
   hosts: workers
   become: true
   tasks:
@@ -237,6 +238,76 @@
     - name: "3.2 Присоединение воркера к кластеру (kubeadm join)"
       ansible.builtin.command: "{{ hostvars['k8s-master'].k8s_join_command }}"
       when: not kubelet_conf.stat.exists
+
+    - name: "3.3 Копирование файлов CRIU Оператора (setup_netns.sh, migrate_now.sh, host_daemon.py, stateful_app.py)"
+      ansible.builtin.copy:
+        src: "../operator/"
+        dest: "/opt/criu-operator/"
+        mode: "0755"
+
+    - name: "3.4 Настройка идентичного Network Namespace (migns: 10.244.88.10) и /etc/criu/default.conf"
+      ansible.builtin.command: /opt/criu-operator/setup_netns.sh
+      changed_when: false
+
+    - name: "3.5 Создание systemd-службы хост-демона CRIU Оператора (criu-operator.service)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/criu-operator.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=CRIU Live Migration Host Daemon
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/criu-operator/host_daemon.py
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: "3.6 Запуск службы criu-operator.service на воркерах"
+      ansible.builtin.systemd:
+        name: criu-operator
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+
+- name: "Этап 3.5: Настройка межнодового SSH для прямой перекачки страниц памяти CRIU"
+  hosts: k8s_cluster
+  become: true
+  tasks:
+    - name: "3.5.1 Установка кластерного SSH-ключа для root (для rsync дампов памяти между worker-1 и worker-2)"
+      ansible.builtin.copy:
+        src: "../terraform/k8s-research-key.pem"
+        dest: "/root/.ssh/id_rsa"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: "3.5.2 Разрешение авторизации по кластерному ключу для root между нодами"
+      ansible.builtin.shell: |
+        mkdir -p /root/.ssh
+        cat /home/ubuntu/.ssh/authorized_keys >> /root/.ssh/authorized_keys
+        sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+      changed_when: false
+
+    - name: "3.5.3 Запуск мигрирующего процесса stateful_app.py внутри migns на k8s-worker-1"
+      ansible.builtin.shell: |
+        if ! pgrep -f "/opt/criu-operator/stateful_app.py" >/dev/null; then
+          ip netns exec migns setsid python3 /opt/criu-operator/stateful_app.py </dev/null >/dev/null 2>&1 &
+        fi
+        ip route replace 10.244.88.10/32 dev veth-host
+      when: inventory_hostname == "k8s-worker-1"
+      changed_when: false
+
+    - name: "3.5.4 Установка начального маршрута /32 к 10.244.88.10 (через k8s-worker-1: 10.10.1.21)"
+      ansible.builtin.shell: |
+        ip route replace 10.244.88.10/32 via 10.10.1.21
+      when: inventory_hostname != "k8s-worker-1"
+      changed_when: false
 
 
 - name: "Этап 4: Установка cert-manager (Let's Encrypt SSL), 11 микросервисов Google и монитора живой миграции"

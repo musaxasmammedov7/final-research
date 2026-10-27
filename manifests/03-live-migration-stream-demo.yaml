@@ -1,153 +1,8 @@
 # ==============================================================================
-# STATEFUL TARGET 2: Интерактивный монитор живой миграции (TCP Stream + RAM State)
-# Держит открытое долгоживущее HTTP Stream / SSE TCP-соединение с браузером,
-# считает тики в оперативной памяти (RAM) и показывает текущее ядро/ноду.
-# Когда под мигрирует через CRIU + Cilium eBPF с worker-1 на worker-2,
-# счетчик в RAM НЕ сбрасывается, а соединение в браузере НЕ рвется!
+# Kubernetes Service + Static Endpoint (10.244.88.10:8090)
+# Интегрирует мигрирующий через CRIU контейнер в Cilium Service Mesh (eBPF LB)
+# и Cilium Ingress Controller (https://musa-research.duckdns.org/live)
 # ==============================================================================
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: live-stream-app-code
-  namespace: boutique
-data:
-  server.py: |
-    import http.server
-    import json
-    import os
-    import socket
-    import time
-    from threading import Thread
-
-    # Глобальное состояние в оперативной памяти (RAM), которое выживает только при CRIU миграции!
-    STATE = {
-        "ram_counter": 0,
-        "started_at": time.strftime("%H:%M:%S"),
-        "pid": os.getpid(),
-    }
-
-    def counter_loop():
-        while True:
-            STATE["ram_counter"] += 1
-            time.sleep(0.1)  # +10 тиков в секунду в оперативной памяти
-
-    Thread(target=counter_loop, daemon=True).start()
-
-    HTML_PAGE = """<!DOCTYPE html>
-    <html lang="ru">
-    <head>
-      <meta charset="UTF-8">
-      <title>CRIU + Cilium eBPF Live Migration Monitor</title>
-      <style>
-        body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 30px; }
-        .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 24px; max-width: 760px; margin: 0 auto; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 20px; }
-        .metric { background: #0f172a; padding: 16px; border-radius: 8px; border-left: 4px solid #38bdf8; }
-        .label { font-size: 13px; color: #94a3b8; text-transform: uppercase; }
-        .val { font-size: 28px; font-weight: 700; margin-top: 6px; font-family: monospace; }
-        .ok { color: #4ade80; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h2>🚀 Живой монитор миграции пода (CRIU + Cilium Service Mesh eBPF)</h2>
-        <p>Это окно держит <b>одно непрерывное долгоживущее TCP-соединение (SSE Stream)</b> с контейнером.</p>
-        <div class="grid">
-          <div class="metric">
-            <div class="label">Счетчик в оперативной памяти (RAM)</div>
-            <div class="val ok" id="counter">0</div>
-          </div>
-          <div class="metric">
-            <div class="label">IP-адрес Пода (Cilium eBPF)</div>
-            <div class="val" id="pod_ip">...</div>
-          </div>
-          <div class="metric">
-            <div class="label">Статус TCP-потока</div>
-            <div class="val ok" id="tcp_status">CONNECTED (0 drops)</div>
-          </div>
-          <div class="metric">
-            <div class="label">Макс. пауза пакета (Freeze Time)</div>
-            <div class="val" id="max_gap">0 ms</div>
-          </div>
-        </div>
-      </div>
-      <script>
-        let lastTs = performance.now();
-        let maxGap = 0;
-        let drops = 0;
-        const evt = new EventSource('/live/stream');
-        evt.onmessage = (e) => {
-          const now = performance.now();
-          const gap = Math.round(now - lastTs);
-          if (gap > maxGap && lastTs > 0) maxGap = gap;
-          lastTs = now;
-          const d = JSON.parse(e.data);
-          document.getElementById('counter').innerText = d.ram_counter;
-          document.getElementById('pod_ip').innerText = d.pod_ip;
-          document.getElementById('max_gap').innerText = maxGap + ' ms';
-        };
-        evt.onerror = () => {
-          drops++;
-          document.getElementById('tcp_status').innerText = 'RECONNECTING (drops: ' + drops + ')';
-          document.getElementById('tcp_status').style.color = '#f87171';
-        };
-      </script>
-    </body>
-    </html>
-    """
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path.startswith("/live/stream"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
-                pod_ip = socket.gethostbyname(socket.gethostname())
-                while True:
-                    payload = json.dumps({
-                        "ram_counter": STATE["ram_counter"],
-                        "pod_ip": pod_ip,
-                        "pid": STATE["pid"]
-                    })
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                    time.sleep(0.1)
-            else:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(HTML_PAGE.encode("utf-8"))
-
-    if __name__ == "__main__":
-        server = http.server.ThreadingHTTPServer(("0.0.0.0", 8090), Handler)
-        server.serve_forever()
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: live-stream-pod
-  namespace: boutique
-  labels:
-    app: live-stream
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: k8s-worker-1
-  containers:
-  - name: stream-server
-    image: python:3.12-slim
-    command: ["python3", "/app/server.py"]
-    ports:
-    - containerPort: 8090
-    volumeMounts:
-    - name: code
-      mountPath: /app
-  volumes:
-  - name: code
-    configMap:
-      name: live-stream-app-code
----
 apiVersion: v1
 kind: Service
 metadata:
@@ -155,9 +10,19 @@ metadata:
   namespace: boutique
 spec:
   type: ClusterIP
-  selector:
-    app: live-stream
   ports:
-  - name: http
-    port: 8090
-    targetPort: 8090
+    - name: http
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: live-stream-service
+  namespace: boutique
+subsets:
+  - addresses:
+      - ip: 10.244.88.10
+    ports:
+      - name: http
+        port: 8090
