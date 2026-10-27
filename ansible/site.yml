@@ -239,7 +239,7 @@
       when: not kubelet_conf.stat.exists
 
 
-- name: "Этап 4: Финальная проверка готовности Cilium Service Mesh (eBPF) и всех нод"
+- name: "Этап 4: Установка cert-manager (Let's Encrypt SSL), 11 микросервисов Google и монитора живой миграции"
   hosts: master
   become: false
   tasks:
@@ -247,11 +247,36 @@
       ansible.builtin.command: cilium status --wait
       changed_when: false
 
-    - name: "4.2 Вывод списка узлов кластера"
-      ansible.builtin.command: kubectl get nodes -o wide
+    - name: "4.2 Установка cert-manager (автоматический выпуск HTTPS-сертификатов Let's Encrypt для Cilium Ingress)"
+      ansible.builtin.command: >
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+      changed_when: false
+
+    - name: "4.3 Ожидание готовности cert-manager"
+      ansible.builtin.command: >
+        kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=180s
+      changed_when: false
+
+    - name: "4.4 Копирование манифестов 11 микросервисов Google и Live-Stream монитора на мастер"
+      ansible.builtin.copy:
+        src: "../manifests/"
+        dest: "/home/ubuntu/manifests/"
+        mode: "0644"
+
+    - name: "4.5 Развертывание 11 микросервисов Google Online Boutique и монитора живой миграции"
+      ansible.builtin.shell: |
+        kubectl apply -f /home/ubuntu/manifests/01-cert-manager-issuer.yaml
+        kubectl apply -f /home/ubuntu/manifests/02-google-online-boutique.yaml
+        kubectl apply -f /home/ubuntu/manifests/03-live-migration-stream-demo.yaml
+      changed_when: false
+
+    - name: "4.6 Вывод списка узлов и запущенных микросервисов"
+      ansible.builtin.shell: |
+        kubectl get nodes -o wide
+        kubectl get pods -n boutique -o wide
       register: nodes_out
       changed_when: false
 
-    - name: "4.3 Статус кластера Kubernetes + Cilium eBPF"
+    - name: "4.7 Статус кластера Kubernetes + Cilium eBPF + 11 микросервисов"
       ansible.builtin.debug:
         msg: "{{ nodes_out.stdout_lines }}"

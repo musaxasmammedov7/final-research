@@ -1,0 +1,38 @@
+# ==============================================================================
+# Cilium Service Mesh Ingress + Автоматический Let's Encrypt HTTPS сертификат
+# Маршрутизирует:
+#   https://<ВАШ_ДОМЕН>/      -> 11 микросервисов Google Online Boutique (frontend)
+#   https://<ВАШ_ДОМЕН>/live  -> Живой монитор миграции TCP-потока и RAM
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: boutique-cilium-ingress
+  namespace: boutique
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: cilium
+  tls:
+    - hosts:
+        # Замените на ваш бесплатный домен (например, с duckdns.org)
+        - k8s-live-migration.duckdns.org
+      secretName: boutique-tls-cert
+  rules:
+    - host: k8s-live-migration.duckdns.org
+      http:
+        paths:
+          - path: /live
+            pathType: Prefix
+            backend:
+              service:
+                name: live-stream-service
+                port:
+                  number: 8090
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
