@@ -121,12 +121,28 @@ resource "aws_security_group" "k8s_sg" {
     self        = true
   }
 
-  # Внешний доступ ТОЛЬКО по SSH (порт 22 по RSA-ключу 4096 бит).
-  # Все внутренние сервисы, K8s API и Hubble UI пробрасываются через защищенный SSH-туннель (Zero-Trust).
+  # Внешний доступ по SSH (порт 22) и через Cilium Ingress Gateway (порты 80/443).
+  # Прямые NodePort (30000-32767) и K8s API (6443) снаружи закрыты!
   ingress {
-    description = "SSH access only"
+    description = "SSH access"
     from_port   = 22
     to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_ssh_cidr]
+  }
+
+  ingress {
+    description = "HTTP traffic via Cilium Service Mesh Ingress"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_ssh_cidr]
+  }
+
+  ingress {
+    description = "HTTPS traffic via Cilium Service Mesh Ingress"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = [var.allowed_ssh_cidr]
   }

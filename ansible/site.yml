@@ -192,7 +192,7 @@
       failed_when: false
       changed_when: false
 
-    - name: "2.6 Установка Cilium Service Mesh с eBPF (kubeProxyReplacement=true, L7 Proxy, Hubble)"
+    - name: "2.6 Установка Cilium Service Mesh с eBPF, Cilium Ingress Controller и Hubble"
       become: false
       ansible.builtin.command: >
         cilium install
@@ -202,6 +202,11 @@
         --set k8sServicePort=6443
         --set bpf.masquerade=true
         --set l7Proxy=true
+        --set ingressController.enabled=true
+        --set ingressController.default=true
+        --set ingressController.loadbalancerMode=shared
+        --set ingressController.enforceHttps=false
+        --set ingressController.hostNetwork.enabled=true
         --set hubble.enabled=true
         --set hubble.relay.enabled=true
         --set hubble.ui.enabled=true
