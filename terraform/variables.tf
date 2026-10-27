@@ -11,15 +11,15 @@ variable "project_name" {
 }
 
 variable "master_instance_type" {
-  description = "Тип EC2 инстанса для Control Plane (k8s-master)"
+  description = "Тип EC2 инстанса для Control Plane (k8s-master, c7i-flex.large — 2 vCPU, 4 GB RAM, Free Tier eligible)"
   type        = string
-  default     = "t3.medium"
+  default     = "c7i-flex.large"
 }
 
 variable "worker_instance_type" {
-  description = "Тип EC2 инстанса для Worker нод (m6i.large — выделенные ресурсы CPU без троттлинга CPU-кредитов t3 для точных бенчмарков)"
+  description = "Тип EC2 инстанса для Worker нод (m7i-flex.large — 2 vCPU, 8 GB RAM, Intel Xeon 4th Gen, Free Tier eligible)"
   type        = string
-  default     = "m6i.large"
+  default     = "m7i-flex.large"
 }
 
 variable "allowed_ssh_cidr" {

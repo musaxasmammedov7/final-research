@@ -21,7 +21,7 @@
 ## 1. Архитектура
 
 * **ОС/ядро:** Ubuntu 24.04 LTS, Linux 6.8+. **Рантайм:** CRI-O 1.31 + CRIU + Buildah (OCI-рантайм `crun` или `runc` выбирается Ansible по наличию поддержки CRIU).
-* **AWS, одна AZ:** `k8s-master` (`t3.medium`, `10.10.1.10`; control plane, Cilium Ingress, OCI-реестр `:5000`), `k8s-worker-1` и `k8s-worker-2` (`m6i.large`, `10.10.1.21/22`).
+* **AWS, одна AZ:** `k8s-master` (`c7i-flex.large`, `10.10.1.10`; control plane, Cilium Ingress, OCI-реестр `:5000`), `k8s-worker-1` и `k8s-worker-2` (`m7i-flex.large`, `10.10.1.21/22`).
 * **Сеть:** Cilium 1.16.3 (`kubeProxyReplacement=true`, пул `10.244.0.0/16`, `l7Proxy`, Ingress в hostNetwork). Домен `musa-research.duckdns.org` + Let's Encrypt через cert-manager.
 * **Нагрузки:** Google Online Boutique (11 микросервисов, `/`) и `live-stream-pod` со счётчиком в RAM (`/live`).
 
