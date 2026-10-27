@@ -1,15 +1,11 @@
 # ==============================================================================
 # АВТОНОМНЫЙ ОПЕРАТОР ЖИВОЙ МИГРАЦИИ KUBERNETES (CRD + Auto-Detector + Controller)
 # ------------------------------------------------------------------------------
-# Оператор работает полностью АВТОМАТИЧЕСКИ (без ручного создания YAML!):
-# Он в реальном времени мониторит состояние всех нод кластера (/api/v1/nodes)
-# и сам автоматически создает `kind: PodLiveMigration` и запускает CRIU миграцию,
-# как только обнаруживает любую из 5 угроз на ноде с живым подом:
-#   1. Node Drain / Cordon (`node.spec.unschedulable == true`) — патч ядра/ребут;
-#   2. Spot Interruption (`taint/label: spot-termination`) — отзыв Spot-сервера;
-#   3. Pre-OOM MemoryPressure (`MemoryPressure == True`) — защита от OOMKiller;
-#   4. Hardware / Network Degradation (`node-degraded == true`) — сбой железа;
-#   5. Node Consolidation (`consolidate == true`) — уплотнение подов для экономии.
+# Оператор работает полностью АВТОМАТИЧЕСКИ на основе официальных сценариев
+# Kubernetes WG Checkpoint/Restore (KEP-2008 & KEP-5823 Motivation/Use Cases):
+#   1. Node Maintenance & Kernel Upgrades (`node.spec.unschedulable == true` при drain/cordon)
+#   2. Spot / Preemptible Instance Evacuation (сигнал отзыва Spot-инстанса)
+#   3. Cluster Consolidation / Bin-Packing (уплотнение подов для освобождения ноды)
 # ==============================================================================
 
 # 1. Регистрация нового типа `kind: PodLiveMigration` в Kubernetes (CRD)
@@ -146,24 +142,23 @@ data:
             return json.loads(resp.read().decode("utf-8"))
 
     def detect_node_hazard(node):
-        """Проверяет 5 официальных причин для автоматической эвакуации подов с ноды."""
+        """
+        Проверяет 3 официальных сценария из спецификаций Kubernetes KEP-2008 / KEP-5823
+        (Kubernetes WG Checkpoint/Restore Motivation & Use Cases):
+        1. NodeMaintenance (kubectl drain / cordon -> node.spec.unschedulable == true)
+        2. SpotInstancePreemption (уведомление об отзыве Spot-сервера)
+        3. ClusterConsolidation (уплотнение нод автоскейлером для выключения простаивающих серверов)
+        """
         spec = node.get("spec", {})
         labels = node.get("metadata", {}).get("labels", {})
-        conditions = {c["type"]: c["status"] for c in node.get("status", {}).get("conditions", [])}
 
-        # Причина 1: Админ запустил kubectl drain / cordon (обновление ядра / обслуживание)
+        # 1. Node Maintenance & OS/Kernel Upgrades (KEP-5823 Use Case #1)
         if spec.get("unschedulable") is True:
-            return "NodeDrainOrMaintenance"
-        # Причина 2: Уведомление об отключении Spot-инстанса AWS (Spot Termination)
+            return "NodeMaintenance"
+        # 2. Spot / Preemptible Instance Interruption (KEP-5823 Use Case #2)
         if labels.get("spot-interruption") == "true":
             return "SpotInstancePreemption"
-        # Причина 3: Критическая нехватка памяти на ноде (спасение от OOMKiller)
-        if conditions.get("MemoryPressure") == "True" or labels.get("memory-pressure") == "true":
-            return "PreOOMMemoryPressure"
-        # Причина 4: Деградация железа или диска (Node Problem Detector)
-        if conditions.get("DiskPressure") == "True" or labels.get("hardware-degraded") == "true":
-            return "HardwareDegradation"
-        # Причина 5: Консолидация (уплотнение) кластера для выключения пустых нод
+        # 3. Cluster Consolidation & Bin-Packing (KEP-5823 Use Case #3)
         if labels.get("consolidate-node") == "true":
             return "ClusterConsolidation"
         return None
