@@ -15,11 +15,10 @@ spec:
   ingressClassName: cilium
   tls:
     - hosts:
-        # Замените на ваш бесплатный домен (например, с duckdns.org)
-        - k8s-live-migration.duckdns.org
+        - musa-research.duckdns.org
       secretName: boutique-tls-cert
   rules:
-    - host: k8s-live-migration.duckdns.org
+    - host: musa-research.duckdns.org
       http:
         paths:
           - path: /live

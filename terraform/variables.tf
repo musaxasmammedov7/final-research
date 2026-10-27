@@ -27,3 +27,17 @@ variable "allowed_ssh_cidr" {
   type        = string
   default     = "0.0.0.0/0"
 }
+
+variable "duckdns_domain" {
+  description = "Имя поддомена на DuckDNS (без .duckdns.org)"
+  type        = string
+  default     = "musa-research"
+}
+
+variable "duckdns_token" {
+  description = "Секретный токен DuckDNS (хранится ТОЛЬКО локально в terraform.tfvars, не попадает в Git!)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+

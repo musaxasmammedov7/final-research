@@ -228,6 +228,9 @@ resource "local_file" "ansible_inventory" {
     ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
     ansible_python_interpreter=/usr/bin/python3
     master_private_ip=${aws_instance.k8s_master.private_ip}
+    master_public_ip=${aws_instance.k8s_master.public_ip}
+    duckdns_domain=${var.duckdns_domain}
+    duckdns_token=${var.duckdns_token}
   EOT
   filename        = "${path.module}/../ansible/inventory.ini"
   file_permission = "0644"

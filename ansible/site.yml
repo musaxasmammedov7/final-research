@@ -247,27 +247,35 @@
       ansible.builtin.command: cilium status --wait
       changed_when: false
 
-    - name: "4.2 Установка cert-manager (автоматический выпуск HTTPS-сертификатов Let's Encrypt для Cilium Ingress)"
+    - name: "4.2 Автоматическая привязка Public IP сервера к домену {{ duckdns_domain }}.duckdns.org"
+      ansible.builtin.uri:
+        url: "https://www.duckdns.org/update?domains={{ duckdns_domain }}&token={{ duckdns_token }}&ip={{ master_public_ip }}"
+        return_content: true
+      when: duckdns_token | length > 0
+      register: duckdns_resp
+
+    - name: "4.3 Установка cert-manager (автоматический выпуск HTTPS-сертификатов Let's Encrypt для Cilium Ingress)"
       ansible.builtin.command: >
         kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
       changed_when: false
 
-    - name: "4.3 Ожидание готовности cert-manager"
+    - name: "4.4 Ожидание готовности cert-manager"
       ansible.builtin.command: >
         kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=180s
       changed_when: false
 
-    - name: "4.4 Копирование манифестов 11 микросервисов Google и Live-Stream монитора на мастер"
+    - name: "4.5 Копирование манифестов 11 микросервисов Google и Live-Stream монитора на мастер"
       ansible.builtin.copy:
         src: "../manifests/"
         dest: "/home/ubuntu/manifests/"
         mode: "0644"
 
-    - name: "4.5 Развертывание 11 микросервисов Google Online Boutique и монитора живой миграции"
+    - name: "4.6 Развертывание 11 микросервисов Google, монитора живой миграции и Cilium HTTPS Ingress"
       ansible.builtin.shell: |
         kubectl apply -f /home/ubuntu/manifests/01-cert-manager-issuer.yaml
         kubectl apply -f /home/ubuntu/manifests/02-google-online-boutique.yaml
         kubectl apply -f /home/ubuntu/manifests/03-live-migration-stream-demo.yaml
+        kubectl apply -f /home/ubuntu/manifests/04-cilium-ingress-https.yaml
       changed_when: false
 
     - name: "4.6 Вывод списка узлов и запущенных микросервисов"

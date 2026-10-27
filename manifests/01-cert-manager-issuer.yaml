@@ -4,8 +4,7 @@ metadata:
   name: letsencrypt-prod
 spec:
   acme:
-    # Замените email на ваш реальный адрес перед применением
-    email: musaxasmammedov7@gmail.com
+    email: musaxasmammedov77@gmail.com
     server: https://acme-v02.api.letsencrypt.org/directory
     privateKeySecretRef:
       name: letsencrypt-prod-account-key
