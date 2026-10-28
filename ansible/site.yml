@@ -1,0 +1,387 @@
+---
+# ==============================================================================
+# PLAY 1: Prepare all 3 nodes (Linux Kernel 6.8+, CRIU, CRI-O v1.31, Buildah, Kubelet)
+# ==============================================================================
+- name: "Stage 1: Configure Linux Kernel, CRIU, CRI-O v1.31, and Buildah across all nodes"
+  hosts: k8s_cluster
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: "1.0 Wait for SSH connectivity on all 3 servers after EC2 boot"
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+        delay: 5
+    - name: "1.0b Gather system facts (setup)"
+      ansible.builtin.setup:
+  tasks:
+    - name: "1.1 Set node hostname (k8s-master / k8s-worker-1 / k8s-worker-2)"
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: "1.2 Disable memory swap (required by kubelet and for deterministic CRIU dumps)"
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: "1.3 Remove swap entries from /etc/fstab"
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+.*)$'
+        replace: '# \1'
+
+    - name: "1.4 Configure persistent loading of overlay and br_netfilter kernel modules"
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s-criu.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: "1.5 Load overlay and br_netfilter kernel modules immediately"
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: "1.6 Tune sysctl kernel parameters for Cilium eBPF and CRIU"
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-k8s-criu-ebpf.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+          net.ipv4.conf.all.rp_filter         = 0
+          net.ipv4.conf.default.rp_filter     = 0
+          vm.unprivileged_userfaultfd         = 1
+          net.netfilter.nf_conntrack_tcp_loose = 1
+
+    - name: "1.7 Apply sysctl kernel parameters"
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: "1.7b Add official CRIU PPA repository (ppa:criu/ppa) for Ubuntu 24.04"
+      ansible.builtin.command: add-apt-repository -y ppa:criu/ppa
+      args:
+        creates: /etc/apt/sources.list.d/criu-ubuntu-ppa-noble.sources
+
+    - name: "1.8 Install system packages: CRIU, crun, runc, buildah, skopeo, conntrack, bpftool"
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - socat
+          - conntrack
+          - ipset
+          - iproute2
+          - nftables
+          - iptables
+          - criu
+          - libcriu2
+          - crun
+          - runc
+          - conmon
+          - buildah
+          - skopeo
+          - rsync
+          - linux-tools-common
+        state: present
+
+    - name: "1.8b Create /etc/criu configuration directory"
+      ansible.builtin.file:
+        path: /etc/criu
+        state: directory
+        mode: "0755"
+
+    - name: "1.9 Configure /etc/criu/default.conf (tcp-close restores listening sockets across Pod IP changes)"
+      ansible.builtin.copy:
+        dest: /etc/criu/default.conf
+        mode: "0644"
+        # Reference: https://criu.org/CLI/opt/--tcp-close - allows restoring servers listening on 0.0.0.0
+        # in an environment with a different IP: all TCP sockets except CLOSED/LISTEN are restored closed.
+        # tcp-established is intentionally omitted because a pod restored on another node receives a new Pod IP.
+        content: |
+          tcp-close
+          shell-job
+          ext-unix-sk
+          skip-in-flight
+          skip-mnt /run/.containerenv
+
+    - name: "1.10 Add official GPG keys for Kubernetes v1.31 and CRI-O v1.31"
+      ansible.builtin.shell: |
+        mkdir -p -m 755 /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        curl -fsSL https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.31/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/cri-o-apt-keyring.gpg
+
+    - name: "1.11 Configure official apt repositories for Kubernetes v1.31 and CRI-O v1.31"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes-crio.list
+        mode: "0644"
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /
+          deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.31/deb/ /
+
+    - name: "1.12 Install CRI-O v1.31 runtime and Kubernetes binaries (kubelet, kubeadm, kubectl, cri-tools)"
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - cri-o
+          - cri-tools
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: "1.13 Enable CRIU Checkpoint/Restore support in CRI-O (/etc/crio/crio.conf.d/99-criu.conf)"
+      ansible.builtin.shell: |
+        if [ -x /usr/libexec/crio/runc ]; then
+          OCI_RT="runc"
+          OCI_PATH="/usr/libexec/crio/runc"
+        else
+          OCI_RT="runc"
+          OCI_PATH=$(command -v runc)
+        fi
+        cat <<EOF > /etc/crio/crio.conf.d/99-criu.conf
+        [crio.runtime]
+        enable_criu_support = true
+        default_runtime = "${OCI_RT}"
+
+        [crio.runtime.runtimes.${OCI_RT}]
+        runtime_path = "${OCI_PATH}"
+        runtime_type = "oci"
+        runtime_root = "/run/${OCI_RT}"
+        EOF
+      changed_when: false
+
+    - name: "1.13b Remove default CRI-O bridge CNI config so pod networking is managed exclusively by Cilium"
+      ansible.builtin.shell: rm -f /etc/cni/net.d/*crio-bridge*.conflist /etc/cni/net.d/*crio-bridge*.conf
+      changed_when: false
+
+    - name: "1.13c Disable signature_policy in CRI-O (signature validation is not supported during container restore)"
+      ansible.builtin.shell: |
+        sed -i 's/^signature_policy/#signature_policy/' /etc/crio/crio.conf.d/10-crio.conf 2>/dev/null || true
+      changed_when: false
+
+    - name: "1.14 Allow insecure HTTP local registry (10.10.1.10:5000) for transferring OCI checkpoint images"
+      ansible.builtin.copy:
+        dest: /etc/containers/registries.conf.d/99-local-checkpoint-registry.conf
+        mode: "0644"
+        content: |
+          [[registry]]
+          location = "10.10.1.10:5000"
+          insecure = true
+
+    - name: "1.14b Configure /etc/crictl.yaml to use the CRI-O UNIX socket directly"
+      ansible.builtin.copy:
+        dest: /etc/crictl.yaml
+        mode: "0644"
+        content: |
+          runtime-endpoint: unix:///var/run/crio/crio.sock
+          image-endpoint: unix:///var/run/crio/crio.sock
+          timeout: 30
+
+    - name: "1.15 Start and enable cri-o and kubelet systemd services"
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: true
+        daemon_reload: true
+      loop:
+        - crio
+        - kubelet
+
+    - name: "1.16 Pre-pull base image python:3.12-slim on all CRI-O nodes (required for CRI-O Restore on target worker)"
+      ansible.builtin.command: crictl pull docker.io/library/python:3.12-slim
+      changed_when: false
+
+
+# ==============================================================================
+# PLAY 2: Initialize Control Plane, deploy Cilium Service Mesh and OCI Registry
+# ==============================================================================
+- name: "Stage 2: Initialize Kubernetes Control Plane (CRI-O) and deploy Cilium Service Mesh (eBPF)"
+  hosts: master
+  become: true
+  tasks:
+    - name: "2.1 Check whether the Kubernetes cluster is already initialized"
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: "2.2 Run kubeadm init with CRI-O socket (skipping kube-proxy in favor of Cilium eBPF)"
+      ansible.builtin.command: >
+        kubeadm init
+        --apiserver-advertise-address={{ private_ip }}
+        --pod-network-cidr=10.244.0.0/16
+        --cri-socket=unix:///var/run/crio/crio.sock
+        --skip-phases=addon/kube-proxy
+      when: not k8s_admin_conf.stat.exists
+
+    - name: "2.3 Configure kubeconfig for the ubuntu user"
+      ansible.builtin.shell: |
+        mkdir -p /home/ubuntu/.kube
+        cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+        chown -R ubuntu:ubuntu /home/ubuntu/.kube
+      changed_when: false
+
+    - name: "2.4 Install Cilium CLI on the master node"
+      ansible.builtin.shell: |
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        curl -L --fail --remote-name-all "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz"
+        tar xzvfC cilium-linux-amd64.tar.gz /usr/local/bin
+        rm -f cilium-linux-amd64.tar.gz
+      args:
+        creates: /usr/local/bin/cilium
+
+    - name: "2.5 Check whether Cilium is already installed in the cluster"
+      become: false
+      ansible.builtin.command: kubectl -n kube-system get daemonset cilium
+      register: cilium_ds
+      failed_when: false
+      changed_when: false
+
+    - name: "2.6 Install Cilium Service Mesh in pure eBPF mode (ClusterIP Ingress, no NodePort)"
+      become: false
+      ansible.builtin.command: >
+        cilium install
+        --version 1.16.3
+        --set kubeProxyReplacement=true
+        --set k8sServiceHost={{ private_ip }}
+        --set k8sServicePort=6443
+        --set ipam.operator.clusterPoolIPv4PodCIDRList="{10.244.0.0/16}"
+        --set bpf.masquerade=true
+        --set l7Proxy=true
+        --set ingressController.enabled=true
+        --set ingressController.default=true
+        --set ingressController.loadbalancerMode=shared
+        --set ingressController.enforceHttps=false
+        --set ingressController.service.type=ClusterIP
+        --set hubble.enabled=true
+        --set hubble.relay.enabled=true
+        --set hubble.ui.enabled=true
+      when: cilium_ds.rc != 0
+
+    - name: "2.6b Bind Cilium Ingress via pure eBPF externalIPs (no NodePort, no iptables)"
+      become: false
+      ansible.builtin.command: >
+        kubectl patch svc cilium-ingress -n kube-system --type='json'
+        -p='[{"op": "replace", "path": "/spec/type", "value": "ClusterIP"}, {"op": "remove", "path": "/spec/externalTrafficPolicy"}, {"op": "add", "path": "/spec/externalIPs", "value": ["{{ private_ip }}"]}]'
+      changed_when: false
+      failed_when: false
+
+    - name: "2.7 Generate kubeadm join command for Worker nodes"
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command_raw
+      changed_when: false
+
+    - name: "2.8 Store worker join command with CRI-O socket parameter"
+      ansible.builtin.set_fact:
+        k8s_join_command: "{{ join_command_raw.stdout }} --cri-socket=unix:///var/run/crio/crio.sock"
+
+
+# ==============================================================================
+# PLAY 3: Join Worker Nodes to the Cluster
+# ==============================================================================
+- name: "Stage 3: Join k8s-worker-1 and k8s-worker-2 to the Kubernetes cluster"
+  hosts: workers
+  become: true
+  tasks:
+    - name: "3.1 Check whether worker node has already joined the cluster"
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: "3.2 Join worker node to the cluster via CRI-O"
+      ansible.builtin.command: "{{ hostvars['k8s-master'].k8s_join_command }}"
+      when: not kubelet_conf.stat.exists
+
+
+# ==============================================================================
+# PLAY 4: Deploy Local OCI Checkpoint Registry, cert-manager, and Cluster Manifests
+# ==============================================================================
+- name: "Stage 4: Deploy OCI Registry, cert-manager, Online Boutique, and CRI-O/Buildah Live Migration Operator"
+  hosts: master
+  become: false
+  tasks:
+    - name: "4.1 Wait for all Cilium pods and cluster nodes to reach Ready state"
+      ansible.builtin.command: cilium status --wait
+      changed_when: false
+
+    - name: "4.2 Automatically bind Master Public IP to {{ duckdns_domain }}.duckdns.org"
+      ansible.builtin.uri:
+        url: "https://www.duckdns.org/update?domains={{ duckdns_domain }}&token={{ duckdns_token }}&ip={{ master_public_ip }}"
+        return_content: true
+      when: duckdns_token | length > 0
+
+    - name: "4.3 Install cert-manager (Let's Encrypt TLS for Cilium Ingress)"
+      ansible.builtin.command: >
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+      changed_when: false
+
+    - name: "4.4 Wait for cert-manager deployments to become Available"
+      ansible.builtin.command: >
+        kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=180s
+      changed_when: false
+
+    - name: "4.5 Copy Kubernetes manifests to master node"
+      ansible.builtin.copy:
+        src: "../manifests/"
+        dest: "/home/ubuntu/manifests/"
+        mode: "0644"
+
+    - name: "4.5b Copy statistical benchmark script (benchmark_migration.py) to master node"
+      ansible.builtin.copy:
+        src: "../scripts/"
+        dest: "/home/ubuntu/scripts/"
+        mode: "0755"
+
+    - name: "4.6 Apply all cluster manifests (Cert-Manager, Boutique, Live-Demo, Ingress, CRI-O Operator)"
+      ansible.builtin.shell: |
+        kubectl apply -f /home/ubuntu/manifests/01-cert-manager-issuer.yaml
+        kubectl apply -f /home/ubuntu/manifests/02-google-online-boutique.yaml
+        kubectl apply -f /home/ubuntu/manifests/03-live-migration-stream-demo.yaml
+        kubectl apply -f /home/ubuntu/manifests/03a-live-stream-template.yaml
+        kubectl apply -f /home/ubuntu/manifests/04-cilium-ingress-https.yaml
+        kubectl apply -f /home/ubuntu/manifests/05-live-migration-operator.yaml
+      changed_when: false
+
+    - name: "4.6b Wait for checkpoint registry, live stream pod, and redis-cart to become Ready"
+      ansible.builtin.shell: |
+        kubectl wait --for=condition=Available deployment/checkpoint-registry -n boutique --timeout=180s
+        kubectl wait --for=condition=Ready pod/live-stream-pod -n boutique --timeout=180s
+        kubectl wait --for=condition=Available deployment/redis-cart -n boutique --timeout=180s
+      changed_when: false
+
+    - name: "4.7 Display cluster nodes, pods, and verify Cilium IPAM cluster-pool mode"
+      ansible.builtin.shell: |
+        cilium config view | grep cluster-pool
+        kubectl get nodes -o wide
+        kubectl get pods -n boutique -o wide
+      register: nodes_out
+      changed_when: false
+
+    - name: "4.7b Smoke-test Cilium Ingress over pure eBPF ClusterIP (no iptables, no NodePort)"
+      ansible.builtin.shell: >
+        INGRESS_IP=$(kubectl -n kube-system get svc cilium-ingress -o jsonpath='{.spec.clusterIP}') &&
+        curl -s -o /dev/null -w '%{http_code}'
+        -H 'Host: {{ duckdns_domain }}.duckdns.org'
+        http://${INGRESS_IP}/live/state
+      register: ingress_smoke
+      changed_when: false
+      failed_when: false
+      retries: 12
+      delay: 5
+      until: ingress_smoke.stdout == "200"
+
+    - name: "4.7c Output Cilium Ingress smoke-test result (expected HTTP 200)"
+      ansible.builtin.debug:
+        msg: "HTTP status /live/state via pure eBPF Cilium Ingress = {{ ingress_smoke.stdout }}"
+
+    - name: "4.8 Output final cluster status"
+      ansible.builtin.debug:
+        msg: "{{ nodes_out.stdout_lines }}"
