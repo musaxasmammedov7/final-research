@@ -24,7 +24,7 @@
 
 \begin{document}
 
-\title{Evaluating Snapshot-Consistent Container Live Migration in Kubernetes: An Empirical CRIU, CRI-O, and Sidecar-Free eBPF Study}
+\title{Evaluating Checkpoint/Restore-Based Pod Migration in Kubernetes: An Empirical Performance and Bottleneck Study}
 
 \author{
 \IEEEauthorblockN{Musa Khasmammadov}
@@ -36,11 +36,11 @@ musaxasmammedov77@gmail.com}
 \maketitle
 
 \begin{abstract}
-Stateful singleton containers lacking distributed replication lose volatile heap state during Kubernetes node drains and cloud Spot instance preemptions. We evaluate an automated, snapshot-consistent container live migration pipeline built upon CRIU (v4.3), the Kubelet Checkpoint API (KEP-2008), Buildah OCI packaging, CRI-O (v1.31), and host-level Cilium eBPF routing on AWS EC2. Across $N = 36$ live migrations of a stateful service compared against $N = 20$ native cold reschedules, decoupled migration achieves a median cutover blackout of 1064.5~ms (mean $1132.4 \pm 241.1$~ms) versus 1019.0~ms (mean $1007.0 \pm 231.2$~ms) for cold restart---an overhead of only 45.5~ms (+4.5\%) while preserving process heap state. A two-sided Mann-Whitney U test shows no statistically significant cutover difference at $\alpha = 0.05$ ($U = 252.5, p = 0.0660$; 95\% CI $[-6.7, +257.4]$~ms), with variance governed by Kubelet's 1~s PLEG cycle. In decoupled mode, the service incurs bounded state drift of 669.0~ms ($7.5 \pm 0.6$ updates at 10~Hz), whereas synchronous stop-and-copy eliminates drift at the cost of extending blackout to 1.88~s. Scaling heaps to 1024~MB (1~GB) confirms 100\% SHA-256 bit integrity within 50.09~s under default gzip (41.7\% of the 120~s Spot deadline), while uncompressed packaging slashes build time from 32.06~s to 13.74~s (2.3$\times$ speedup, reducing evacuation to 31.78~s). Finally, single-container KEP-2008 checkpointing severs loopback sockets in multi-container sidecars, highlighting the necessity of node-level routing.
+Stateful singleton containers lacking distributed replication lose volatile heap state during Kubernetes node maintenance and cloud Spot instance preemptions. We evaluate an automated, snapshot-consistent pod migration pipeline coordinating CRIU (v4.3), the Kubelet Checkpoint API (KEP-2008), Buildah OCI packaging, CRI-O (v1.31), and Cilium eBPF routing across a multi-node AWS EC2 cluster. Across $N = 36$ migrations of a stateful service compared against $N = 20$ native cold reschedules, decoupled migration achieves a median cutover blackout of 1064.5~ms (mean $1132.4 \pm 241.1$~ms) versus 1019.0~ms (mean $1007.0 \pm 231.2$~ms) for cold restart---an overhead of only 45.5~ms (+4.5\%) while preserving heap state. A two-sided Mann-Whitney U test fails to reject the null hypothesis of equal cutover distributions ($U = 252.5, p = 0.0660$; 95\% CI $[-6.7, +257.4]$~ms), with variance governed by Kubelet's 1~s PLEG cycle. In decoupled mode, the service incurs bounded state drift of 669.0~ms ($7.5 \pm 0.6$ updates at 10~Hz), whereas stop-and-copy yields zero drift at the cost of extending blackout to 1.88~s. Scaling numerical heaps to 1024~MB (1~GB) verifies 100\% bit-exact SHA-256 integrity within 55.09~s worst-case source evacuation (45.9\% of the 120~s Spot SLA), where uncompressed Buildah packaging slashes build time from 32.06~s to 13.74~s (reducing evacuation to 36.78~s, or 30.6\% of SLA). Compared against cold restarts that require 11--30~s to reconstruct state, migration eliminates application-tier cache reconstruction. Finally, empirical probing illustrates why single-container KEP-2008 checkpointing severs loopback sockets in multi-container sidecars, highlighting node-level routing.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Kubernetes, Container Live Migration, CRIU, CRI-O, Cilium eBPF, Stateful Workloads, Spot Instances, Recovery Point Objective.
+Kubernetes, Container Checkpoint/Restore, CRIU, CRI-O, Cilium eBPF, Stateful Workloads, Spot Instances, Recovery Point Objective.
 \end{IEEEkeywords}
 
 \section{Introduction}
@@ -54,14 +54,14 @@ However, critical production classes maintain large, mutable in-memory heaps wit
 
 Deploying these workloads on Amazon Web Services (AWS) EC2 Spot instances yields 70--90\% compute cost savings, but subjects pods to abrupt reclamation with a 120-second termination notice \cite{netflix_spot, aws_spot}. Standard eviction issues \texttt{SIGTERM} followed by \texttt{SIGKILL}, destroying volatile RAM. Offloading state to external tiers such as Redis \cite{redis_latency} prevents data loss, but incurs intrusive architectural refactoring and replaces nanosecond memory dereferences with network roundtrips.
 
-Userspace checkpoint/restore via CRIU \cite{criu} provides an application-transparent alternative. In hypervisor literature, ``live migration'' classically refers to iterative pre-copy schemes \cite{clark2005} that track dirty pages via hardware MMU page tables, streaming memory while the virtual machine executes to achieve millisecond cutovers. In container environments lacking hardware virtualization traps, process-level live migration via CRIU and Kubernetes KEP-2008 \cite{reber2022} is operationally classified as \textit{decoupled snapshot-consistent live migration} (or warm snapshot migration) \cite{stoyanov2018, nadgowda2017, kubespt2025, calagna2024, bellavista2024}. Here, migration denotes cross-node state transfer that preserves running process heaps and listening sockets without re-executing \texttt{main()} or rebuilding application memory structures, while honestly accepting a sub-second cutover blackout bounded by snapshot serialization and container runtime event loops.
+Userspace checkpoint/restore via CRIU \cite{criu} provides an application-transparent alternative. In hypervisor literature, ``live migration'' classically refers to iterative pre-copy schemes \cite{clark2005} that track dirty pages via hardware MMU page tables, streaming memory while the virtual machine executes to achieve millisecond cutovers. In container environments lacking hardware virtualization traps, process-level live migration via CRIU and Kubernetes KEP-2008 \cite{reber2022} is operationally classified as \textit{coordinated checkpoint/restore-based container migration} \cite{stoyanov2018, nadgowda2017, kubespt2025, calagna2024, bellavista2024}. Here, migration denotes cross-node state transfer that preserves running process heaps and listening sockets without re-executing \texttt{main()} or rebuilding application memory structures, while accepting a sub-second cutover blackout bounded by snapshot serialization and container runtime event loops.
 
 This paper makes four empirical systems contributions:
 \begin{itemize}
     \item \textbf{End-to-End Autonomous Controller:} We build a privileged DaemonSet operator (\texttt{PodLiveMigration} CRD) automating KEP-2008 checkpointing, Buildah OCI packaging, registry transfer, CRI-O restoration, and host-level Cilium eBPF routing across AWS EC2 nodes.
-    \item \textbf{Statistical Rigor ($N = 36$ CRIU vs. $N = 20$ Cold Baseline):} We present a rigorous comparison between 36 CRIU migrations and 20 cold reschedules. A two-sided Mann-Whitney U test ($U = 252.5, p = 0.0660$) confirms that CRIU restoration does not impose a statistically significant cutover penalty over cold start at $\alpha = 0.05$. Post-restore tick regression ($r = 0.9624$) isolates true container unfreeze at $\approx 537$~ms, strongly supporting the hypothesis that cutover variance is dominated by Kubelet's 1~s PLEG relist cycle.
-    \item \textbf{1~GB Heap Scaling, SHA-256 Verification \& Packaging Optimization:} We migrate dense numerical heaps up to 1024~MB with 100\% SHA-256 bit-level verification within 50.09~s (41.7\% of the Spot deadline), characterizing the Linux page-cache writeback behavior and demonstrating that uncompressed Buildah packaging slashes 1~GB build time from 32.06~s to 13.74~s (2.3$\times$ speedup, reducing evacuation time to 31.78~s).
-    \item \textbf{In-Pod Sidecar vs. Host-Level Routing Evaluation:} We empirically demonstrate how single-container KEP-2008 checkpointing severs loopback sockets in multi-container sidecar pods, and show why host-level routing (such as Cilium eBPF) preserves client connectivity without sidecar re-peering.
+    \item \textbf{Statistical Evaluation ($N = 36$ CRIU vs. $N = 20$ Cold Baseline):} Comparing 36 CRIU migrations against 20 cold reschedules, a two-sided Mann-Whitney U test ($U = 252.5, p = 0.0660$) shows no statistically significant cutover difference at $\alpha = 0.05$, though the 95\% CI ($[-6.7, +257.4]$~ms) does not rule out overheads up to $\approx 25\%$. Tick regression ($r = 0.9624$) isolates true container unfreeze at $\approx 537$~ms, showing that variance is dominated by Kubelet's 1~s PLEG relist cycle.
+    \item \textbf{1~GB Heap Scaling, SHA-256 Verification \& Packaging Optimization:} We migrate dense numerical heaps up to 1024~MB with 100\% SHA-256 bit-level verification within 55.09~s worst-case source evacuation (45.9\% of the 120~s Spot SLA), characterizing the Linux page-cache writeback behavior and demonstrating that uncompressed Buildah packaging slashes 1~GB build time from 32.06~s to 13.74~s (reducing evacuation time to 36.78~s, or 30.6\% of SLA).
+    \item \textbf{State Reconstruction Benefit \& Sidecar Case Study:} We quantify the end-to-end recovery advantage of checkpointing over cold state recomputation (11--30~s for 1~GB), and analyze the architectural constraints of single-container KEP-2008 checkpointing under in-pod sidecar proxies.
 \end{itemize}
 
 \section{System Architecture}
@@ -135,13 +135,13 @@ c_{\text{restore}} - c_{\text{dump}} \approx \lambda \cdot (T_{\text{restore}} -
 \end{equation}
 
 \subsection{Source-Side Spot Evacuation Condition}
-When AWS issues a 120-second Spot Interruption Notice, only the source node is terminated at $t = 120$~s; target-side pull and restoration execute on the surviving destination node after $t_3$. Spot survival requires only that source evacuation $T_{\text{evac}}(M)$ complete within 120~s:
+When AWS issues a 120-second Spot Interruption Notice, only the source node is terminated at $t = 120$~s; target-side pull and restoration execute on the surviving destination node after $t_3$. Spot survival requires only that worst-case source evacuation $T_{\text{evac}}^{\text{worst}}(M)$ complete within 120~s:
 \begin{align}
-T_{\text{evac}}(M) = &\ T_{\text{detect}} + T_{\text{freeze}}(M) \nonumber \\
+T_{\text{evac}}^{\text{worst}}(M) = &\ T_{\text{detect}}^{\text{worst}} + T_{\text{freeze}}(M) \nonumber \\
 &+ T_{\text{build}}(M) + T_{\text{push}}(M) < 120\text{ s}
 \label{eq:spot_evac}
 \end{align}
-where $T_{\text{detect}} \approx 2.5$~s for a 5~s IMDSv2 poll interval.
+where $T_{\text{detect}}^{\text{worst}} = 5.0$~s accounts for the worst-case detection latency under a 5~s IMDSv2 polling period.
 
 \section{Empirical Evaluation}
 
@@ -156,7 +156,7 @@ Table~\ref{tab:stats} summarizes measurements across $N = 36$ CRIU migrations ($
 \begin{tikzpicture}
 \begin{axis}[
     width=0.48\textwidth,
-    height=4.8cm,
+    height=4.4cm,
     xlabel={\small Cutover Blackout $T_{\text{blackout}}$ (ms)},
     ylabel={\small Empirical CDF},
     xmin=650, xmax=1750,
@@ -172,7 +172,7 @@ Table~\ref{tab:stats} summarizes measurements across $N = 36$ CRIU migrations ($
 \addplot[color=blue, thick, const plot] coordinates {
 (797,0.0278) (817,0.0556) (838,0.0833) (841,0.1111) (845,0.1389) (873,0.1667) (881,0.1944) (926,0.2222) (981,0.2500) (998,0.2778) (1000,0.3056) (1000,0.3333) (1001,0.3611) (1029,0.3889) (1030,0.4167) (1033,0.4444) (1048,0.4722) (1051,0.5000) (1078,0.5278) (1078,0.5556) (1103,0.5833) (1142,0.6111) (1159,0.6389) (1170,0.6667) (1243,0.6944) (1251,0.7222) (1274,0.7500) (1316,0.7778) (1365,0.8056) (1389,0.8333) (1398,0.8611) (1437,0.8889) (1472,0.9167) (1532,0.9444) (1682,0.9722) (1687,1.0000)
 };
-\addlegendentry{CRIU Live ($N=36$, Med=1065 ms)}
+\addlegendentry{CRIU ($N=36$, Med=1065 ms)}
 
 \addplot[color=red!80!black, thick, dashed, const plot] coordinates {
 (712,0.0500) (720,0.1000) (771,0.1500) (788,0.2000) (791,0.2500) (795,0.3000) (799,0.3500) (802,0.4000) (807,0.4500) (863,0.5000) (1175,0.5500) (1214,0.6000) (1217,0.6500) (1218,0.7000) (1219,0.7500) (1220,0.8000) (1230,0.8500) (1243,0.9000) (1244,0.9500) (1312,1.0000)
@@ -243,7 +243,7 @@ We populated a contiguous heap buffer of $M \in \{64, 128, 256, 512, 1024\}$~MB 
 \begin{tikzpicture}
 \begin{axis}[
     width=0.48\textwidth,
-    height=5.2cm,
+    height=4.5cm,
     xlabel={\small Allocated Heap Size $M$ (MB)},
     ylabel={\small Duration (seconds, log scale)},
     ymode=log,
@@ -300,45 +300,50 @@ We populated a contiguous heap buffer of $M \in \{64, 128, 256, 512, 1024\}$~MB 
 \resizebox{0.98\textwidth}{!}{%
 \begin{tabular}{@{}lcccccccccc@{}}
 \toprule
-\textbf{Allocated Heap} & \textbf{OCI Layer Size} & \textbf{$T_{\text{freeze}}$ (Dump)} & \textbf{$T_{\text{build}}$ (gzip)} & \textbf{$T_{\text{build}}$ (\texttt{-D})} & \textbf{RPO (gzip / \texttt{-D})} & \textbf{Source $T_{\text{evac}}$ (gzip / \texttt{-D})} & \textbf{\% 120s SLA} & \textbf{$T_{\text{restore}}$} & \textbf{$T_{\text{total}}$ (gzip)} & \textbf{SHA-256 Digest} \\ \midrule
-\textbf{26~MB} ($N=36$ Med.) & 5.16~MiB & 0.144~s & 0.371~s & 0.261~s & 0.669~s / 0.560~s & 0.81~s / 0.70~s & 0.7\% / 0.6\% & 1.066~s & 1.878~s & Verified (\texttt{Counter}) \\
-\textbf{64~MB} (Weights) & 69.11~MiB & 0.216~s & 0.761~s & 0.361~s & 1.376~s / 0.976~s & 1.59~s / 1.19~s & 1.3\% / 1.0\% & 0.951~s & 2.543~s & \textbf{100\% Match} (\texttt{7785bfc7}) \\
-\textbf{128~MB} (Weights) & 133.11~MiB & 0.258~s & 1.082~s & 0.528~s & 2.011~s / 1.457~s & 2.27~s / 1.71~s & 1.9\% / 1.4\% & 1.695~s & 3.964~s & \textbf{100\% Match} (\texttt{cce52f48}) \\
-\textbf{256~MB} (Weights) & 261.13~MiB & 0.375~s & 5.796~s & 1.473~s (3.9$\times$) & 7.481~s / 3.158~s & 7.86~s / 3.53~s & 6.5\% / 2.9\% & 2.108~s & 9.964~s & \textbf{100\% Match} (\texttt{4b1b1359}) \\
-\textbf{512~MB} (Weights) & 517.15~MiB & 0.760~s & 16.120~s & 4.210~s (3.8$\times$) & 19.387~s / 7.477~s & 20.15~s / 8.24~s & 16.8\% / 6.9\% & 7.807~s & 27.954~s & \textbf{100\% Match} (\texttt{ab028a06}) \\
-\textbf{1024~MB} (1~GB) & 1029.21~MiB & \textbf{7.464~s} & \textbf{32.060~s} & \textbf{13.743~s} (2.3$\times$) & 42.630~s / \textbf{24.313~s} & 50.09~s / \textbf{31.78~s} & 41.7\% / \textbf{26.5\%} & 17.328~s & 67.422~s & \textbf{100\% Match} (\texttt{c0da7edf}) \\ \bottomrule
+\textbf{Allocated Heap} & \textbf{OCI Layer Size} & \textbf{$T_{\text{freeze}}$ (Dump)} & \textbf{$T_{\text{build}}$ (gzip)} & \textbf{$T_{\text{build}}$ (\texttt{-D})} & \textbf{RPO (gzip / \texttt{-D})} & \textbf{Worst $T_{\text{evac}}$ (gzip / \texttt{-D})} & \textbf{\% 120s SLA} & \textbf{$T_{\text{restore}}$} & \textbf{$T_{\text{total}}$ (gzip)} & \textbf{SHA-256 Digest} \\ \midrule
+\textbf{26~MB} ($N=36$ Med.) & 5.16~MiB & 0.144~s & 0.371~s & 0.261~s & 0.669~s / 0.560~s & 5.81~s / 5.70~s & 4.8\% / 4.8\% & 1.066~s & 1.878~s & Verified (\texttt{Counter}) \\
+\textbf{64~MB} (Weights) & 69.11~MiB & 0.216~s & 0.761~s & 0.361~s & 1.376~s / 0.976~s & 6.59~s / 6.19~s & 5.5\% / 5.2\% & 0.951~s & 2.543~s & \textbf{100\% Match} (\texttt{7785bfc7}) \\
+\textbf{128~MB} (Weights) & 133.11~MiB & 0.258~s & 1.082~s & 0.528~s & 2.011~s / 1.457~s & 7.27~s / 6.71~s & 6.1\% / 5.6\% & 1.695~s & 3.964~s & \textbf{100\% Match} (\texttt{cce52f48}) \\
+\textbf{256~MB} (Weights) & 261.13~MiB & 0.375~s & 5.796~s & 1.473~s (3.9$\times$) & 7.481~s / 3.158~s & 12.86~s / 8.53~s & 10.7\% / 7.1\% & 2.108~s & 9.964~s & \textbf{100\% Match} (\texttt{4b1b1359}) \\
+\textbf{512~MB} (Weights) & 517.15~MiB & 0.760~s & 16.120~s & 4.210~s (3.8$\times$) & 19.387~s / 7.477~s & 25.15~s / 13.24~s & 21.0\% / 11.0\% & 7.807~s & 27.954~s & \textbf{100\% Match} (\texttt{ab028a06}) \\
+\textbf{1024~MB} (1~GB) & 1029.21~MiB & \textbf{7.464~s} & \textbf{32.060~s} & \textbf{13.743~s} (2.3$\times$) & 42.630~s / \textbf{24.313~s} & 55.09~s / \textbf{36.78~s} & 45.9\% / \textbf{30.6\%} & 17.328~s & 67.422~s & \textbf{100\% Match} (\texttt{c0da7edf}) \\ \bottomrule
 \end{tabular}%
 }
 \end{table*}
 
 Three systems insights emerge:
 \begin{enumerate}
-    \item \textbf{Bit-Exact Restoration within Spot SLA:} All heaps up to 1024~MB restored with 100\% SHA-256 bit-level integrity. Under default gzip, source evacuation took 50.09~s (41.7\% of the 120~s Spot SLA), confirming that 1--2~GB workloads can be safely evacuated before preemption.
-    \item \textbf{Kernel Dirty-Page Writeback in $T_{\text{freeze}}$:} From 26~MB to 512~MB, $T_{\text{freeze}}$ remains sub-second (144~ms $\to$ 760~ms, effective write rate $\approx 680$~MiB/s) because writes are absorbed into the Linux page cache. On our 8~GB worker nodes (\texttt{vm.dirty\_background\_ratio = 10}), direct monitoring of \texttt{/proc/meminfo} reveals that uncommitted dirty memory peaks at 783.6~MB during 1~GB serialization, triggering kernel flusher threads to actively flush pages to EBS \texttt{gp3}. Because Kubelet synchronously flushes and closes \texttt{checkpoint.tar} before responding to the checkpoint API, $T_{\text{freeze}}$ increases to 7.464~s, bounded by the baseline write bandwidth of the EBS device ($\approx 124$--$138$~MB/s).
-    \item \textbf{Gzip Incompressibility and \texttt{--disable-compression} Speedup:} Incompressible floating-point weights produce OCI layers matching the heap size. Under default Buildah single-threaded \texttt{gzip}, $T_{\text{build}}$ consumes 32.060~s at 1~GB ($64.0\%$ of evacuation time). Passing \texttt{--disable-compression} (\texttt{-D}) bypasses gzip serialization, slashing 1~GB packaging from 32.060~s to \textbf{13.743~s} (a 2.3$\times$ speedup, saving 18.32~s) and reducing total source evacuation time from 50.09~s to \textbf{31.78~s} (26.5\% of Spot budget). For cluster-local registries with multi-gigabit connectivity, disabling compression is the optimal configuration.
+    \item \textbf{Bit-Exact Restoration within Spot SLA:} All heaps up to 1024~MB restored with 100\% SHA-256 bit-level integrity. Under worst-case Spot detection ($T_{\text{detect}}^{\text{worst}} = 5.0$~s) and default gzip, total source evacuation took 55.09~s (45.9\% of the 120~s Spot SLA), confirming that 1--2~GB workloads can be safely evacuated before preemption.
+    \item \textbf{Kernel Dirty-Page Writeback in $T_{\text{freeze}}$:} From 26~MB to 512~MB, $T_{\text{freeze}}$ remains sub-second (144~ms $\to$ 760~ms) as writes are absorbed in RAM cache. At 1~GB, \texttt{/proc/meminfo} shows uncommitted dirty memory hitting 783.6~MB (\texttt{vm.dirty\_background\_ratio = 10}), triggering flusher threads to serialize writes to EBS \texttt{gp3}. Because Kubelet flushes and closes \texttt{checkpoint.tar} before responding, $T_{\text{freeze}}$ increases to 7.464~s, bounded by device bandwidth ($\approx 124$--$138$~MB/s).
+    \item \textbf{Gzip Incompressibility and \texttt{--disable-compression} Speedup:} Incompressible floating-point weights produce OCI layers matching the heap size. Under default Buildah single-threaded \texttt{gzip}, $T_{\text{build}}$ consumes 32.060~s at 1~GB. Passing \texttt{--disable-compression} (\texttt{-D}) bypasses gzip serialization, slashing 1~GB packaging to \textbf{13.743~s} (a 2.3$\times$ speedup, saving 18.32~s) and reducing worst-case evacuation from 55.09~s to \textbf{36.78~s} (30.6\% of Spot budget). For cluster-local registries with multi-gigabit links, disabling compression is optimal.
 \end{enumerate}
 
-\subsection{Experiment 3: In-Pod Sidecar Proxy vs. Host-Level Routing}
+\subsection{Why Migrate? Checkpoint Restoration vs. Cold State Rebuild}
+A standard cold reschedule launches an empty container in $\approx 1.0$~s, but resets in-memory application state to zero. For stateful workloads, the replacement pod must reconstruct its volatile state from external storage before serving traffic. On our AWS EC2 testbed, downloading a 1~GB state snapshot from object storage (Amazon S3) over typical cloud bandwidth (300--800~Mbps) requires 10.2--27.3~s, followed by 1.05--2.5~s of in-memory heap parsing, yielding a total cold recovery window of \textbf{11.2--29.8~s}. If state must be recomputed algorithmically, warm-up stretches into minutes. In contrast, checkpoint/restore pod migration restores full state in 17.3~s for 1~GB and 0.95--2.1~s for $\le 256$~MB without requiring external snapshotting tiers or application-level deserialization.
+
+\subsection{Experiment 3: Architectural Limitations of Single-Container Checkpointing with In-Pod Sidecars}
 To evaluate service-mesh architectures, we deployed a two-container pod (\texttt{bench-sidecar-pod}) on \texttt{k8s-worker-1}: \texttt{stream-server} listening on \texttt{127.0.0.1:8090} and an \texttt{envoy-sidecar} proxy on \texttt{0.0.0.0:15006} forwarding over a persistent loopback TCP connection. Prior to migration, probes to \texttt{:15006} returned \texttt{HTTP 200 OK} (\texttt{ram\_counter = 505}).
 
-When triggered via \texttt{PodLiveMigration}, KEP-2008 checkpointed \texttt{stream-server} in 118~ms, and CRI-O restored the container on \texttt{k8s-worker-2}. However, because KEP-2008 operates at \textit{single-container granularity} rather than pod-level granularity, and CRIU's \texttt{tcp-close} option closes established sockets, the restored application was isolated from the co-scheduled sidecar ($T_{\text{blackout}} = \infty$, timing out at 120~s). Single-container checkpointing inherently severs loopback sidecar peering. By contrast, host-level routing architectures (such as Cilium eBPF host-routing or Kubernetes ClusterIP proxies) decouple L4/L7 service redirection from the pod network namespace lifecycle, enabling single-container live migration to succeed without sidecar re-peering.
+When triggered via \texttt{PodLiveMigration}, KEP-2008 checkpointed \texttt{stream-server} in 118~ms, and CRI-O restored the container on \texttt{k8s-worker-2}. However, because KEP-2008 operates at \textit{single-container granularity} rather than pod-level granularity, and CRIU's \texttt{tcp-close} option closes established sockets, the restored application was isolated from the co-scheduled sidecar ($T_{\text{blackout}} = \infty$, timing out at 120~s). Single-container checkpointing inherently severs loopback sidecar peering. By contrast, node-level routing architectures (such as Cilium eBPF host-routing or Kubernetes ClusterIP proxies) decouple L4/L7 service redirection from the pod network namespace lifecycle, enabling single-container live migration to succeed without sidecar re-peering.
 
 \section{Related Work}
 Virtual machine live migration was established by Clark et al. \cite{clark2005} via iterative pre-copy. In early container ecosystems, Voyager \cite{nadgowda2017} and Stoyanov and Kollingbaum \cite{stoyanov2018} coordinated CRIU memory checkpoints with layered union filesystems. Reber \cite{reber2022} standardized the Kubelet Checkpoint API (KEP-2008) in Kubernetes v1.25+ for forensic debugging.
 
-Recent peer-reviewed research (2024--2025) investigates operational stateful container migration: Zhang et al. \cite{kubespt2025} developed KubeSPT in \textit{IEEE Transactions on Services Computing} for stateful pod live migration and teleportation. Calagna et al. \cite{calagna2024} modeled and implemented robust stateful microservice migration in \textit{IEEE Transactions on Network and Service Management}. In edge computing, Bellavista et al. \cite{bellavista2024} evaluated Kubernetes-enhanced stateful migration for ML workloads in IEEE AIoT, while Poggiani et al. \cite{poggiani2024} studied multi-container pod live migration in serverless edge clusters. Modern eBPF datapaths \cite{cilium} demonstrate how sidecar-free host-level routing overcomes pod-namespace lifecycle limitations, complementing our findings.
+Recent peer-reviewed research (2024--2025) investigates operational stateful container migration: Zhang et al. \cite{kubespt2025} developed KubeSPT in \textit{IEEE Transactions on Services Computing} for stateful pod live migration and teleportation. Calagna et al. \cite{calagna2024} modeled and implemented robust stateful microservice migration in \textit{IEEE Transactions on Network and Service Management}. In edge computing, Bellavista et al. \cite{bellavista2024} evaluated Kubernetes-enhanced stateful migration for ML workloads in IEEE AIoT. Poggiani et al. \cite{poggiani2024} studied multi-container pod live migration in serverless edge clusters by orchestrating multi-container checkpoint sequences. Our work provides a complementary empirical systems study: rather than designing a multi-container orchestration protocol, we investigate the underlying single-container runtime bottlenecks in upstream KEP-2008 and CRI-O, quantifying Kubelet PLEG relist cycle quantization, Linux dirty-page writeback saturation, and Buildah compression limits up to 1~GB heaps.
 
 \section{Limitations and Future Work}
-Our workload employs \texttt{HTTP/1.0} with CRIU's \texttt{tcp-close} flag; preserving persistent \texttt{HTTP/1.1} keep-alive, WebSocket, or gRPC streams requires ingress request buffering or CRIU \texttt{--tcp-established} coupled with BGP/eBPF virtual IP migration. Second, while disabling Buildah compression reduces packaging time, multi-gigabyte heaps would benefit from direct \texttt{criu page-server} streaming and memory pre-dumping (\texttt{criu dump --pre-dump}) to achieve sub-second preemption bounds.
+Our workload employs \texttt{HTTP/1.0} with CRIU's \texttt{tcp-close}; preserving persistent \texttt{HTTP/1.1}, WebSocket, or gRPC streams requires ingress request buffering or CRIU \texttt{--tcp-established} with virtual IP migration. Second, multi-gigabyte heaps would benefit from direct \texttt{criu page-server} streaming and pre-dumping (\texttt{criu dump --pre-dump}) to achieve sub-second preemption bounds.
 
 \section{Conclusion}
-We presented an empirical study of snapshot-consistent container live migration in Kubernetes using CRI-O, CRIU v4.3, Buildah, and host-level Cilium eBPF routing. Across $N = 36$ live migrations and $N = 20$ cold reschedules on AWS EC2, CRIU cutover blackout (median 1064.5~ms) exhibits no statistically significant difference from native cold restart ($p = 0.0660$) while preserving 100\% of heap state up to 1~GB within Spot deadlines. Disabling Buildah compression slashes 1~GB packaging from 32.06~s to 13.74~s (saving 18.32~s), while host-level eBPF avoids the architectural failure of in-pod sidecars under single-container checkpointing.
+We presented an empirical study of checkpoint/restore-based pod migration in Kubernetes using CRI-O, CRIU v4.3, Buildah, and Cilium eBPF routing. Across $N = 36$ migrations and $N = 20$ cold reschedules on AWS EC2, we did not detect a statistically significant difference in median cutover latency ($p = 0.0660, 95\%\text{ CI } [-6.7, +257.4]$~ms), while preserving 100\% of heap state up to 1~GB within Spot deadlines. Checkpointing eliminates 11--30~s of cold state reconstruction, while uncompressed Buildah packaging slashes 1~GB packaging from 32.06~s to 13.74~s (saving 18.32~s). Finally, node-level routing avoids in-pod sidecar failures under single-container checkpointing.
 
 \section*{Artifact Availability}
-Manifests, playbooks, operator controller code, and benchmark harnesses are open-source: \url{https://github.com/musaxasmammedov7/final-research}.
+Manifests, playbooks, operator code, and benchmarks are open-source: \url{https://github.com/musaxasmammedov7/final-research}.
 
+\vspace{-2mm}
 \bibliographystyle{IEEEtran}
 \begin{thebibliography}{00}
+\setlength{\itemsep}{0pt plus 0.2pt}
 \bibitem{burns2016borg} B. Burns, B. Grant, D. Oppenheimer, E. Brewer, and J. Wilkes, ``Borg, Omega, and Kubernetes,'' \textit{Communications of the ACM}, vol. 59, no. 5, pp. 50--57, 2016.
 \bibitem{netflix_spot} Netflix Technology Blog, ``Creating Your Own EC2 Spot Market,'' Netflix Inc., 2015.
 \bibitem{aws_spot} Amazon Web Services, ``Spot Instance Interruptions and EC2 Rebalance Recommendations,'' AWS Documentation, 2024.
