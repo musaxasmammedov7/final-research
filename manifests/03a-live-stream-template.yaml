@@ -1,0 +1,275 @@
+apiVersion: v1
+data:
+  pod.json: '{"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "live-stream-pod",
+    "namespace": "boutique", "labels": {"app": "live-stream"}}, "spec": {"automountServiceAccountToken":
+    false, "nodeName": "k8s-worker-1", "tolerations": [{"operator": "Exists"}], "containers":
+    [{"name": "stream-server", "image": "docker.io/library/python:3.12-slim", "command":
+    ["python3", "-c", "import http.server, json, os, socket, time, urllib.request\nfrom
+    threading import Thread\n\nSTATE = {\n    \"ram_counter\": 0,\n    \"started_at\":
+    time.strftime(\"%H:%M:%S\"),\n    \"pid\": os.getpid(),\n    \"node\": \"k8s-worker-1\",\n    \"migrations\":
+    [],\n}\n\ndef counter_loop():\n    while True:\n        STATE[\"ram_counter\"]
+    += 1\n        time.sleep(0.1)\n\nThread(target=counter_loop, daemon=True).start()\n\ndef
+    get_current_pod_ip():\n    try:\n        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n        s.connect((\"10.10.1.10\",
+    80))\n        ip = s.getsockname()[0]\n        s.close()\n        return ip\n    except
+    Exception:\n        return \"unknown\"\n\nHTML = \"\"\"<!DOCTYPE html><html lang=\"en\"><head><meta
+    charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Stateful
+    Container Live Migration Console</title>\n<style>\n  :root {\n    --bg: #07090e;\n    --card:
+    #0d121d;\n    --card-border: rgba(255, 255, 255, 0.08);\n    --card-hover: rgba(255,
+    255, 255, 0.12);\n    --cyan: #38bdf8;\n    --emerald: #10b981;\n    --emerald-glow:
+    rgba(16, 185, 129, 0.25);\n    --text: #f1f5f9;\n    --muted: #64748b;\n    --font-mono:
+    ui-monospace, \"SF Mono\", \"JetBrains Mono\", Menlo, Consolas, monospace;\n  }\n  *
+    { box-sizing: border-box; }\n  body {\n    font-family: -apple-system, BlinkMacSystemFont,
+    \"Segoe UI\", Roboto, \"Inter\", sans-serif;\n    background: var(--bg);\n    color:
+    var(--text);\n    margin: 0;\n    padding: 28px 20px;\n    min-height: 100vh;\n    background-image:
+    radial-gradient(circle at 50% -20%, rgba(56, 189, 248, 0.08), transparent 70%);\n  }\n  .container
+    { max-width: 1180px; margin: 0 auto; }\n  \n  /* Header */\n  .header {\n    display:
+    flex;\n    justify-content: space-between;\n    align-items: center;\n    border-bottom:
+    1px solid var(--card-border);\n    padding-bottom: 20px;\n    margin-bottom: 24px;\n  }\n  .brand
+    { display: flex; align-items: center; gap: 12px; }\n  .brand-badge {\n    background:
+    rgba(56, 189, 248, 0.1);\n    color: var(--cyan);\n    border: 1px solid rgba(56,
+    189, 248, 0.25);\n    font-family: var(--font-mono);\n    font-size: 11px;\n    font-weight:
+    700;\n    padding: 4px 8px;\n    border-radius: 6px;\n    letter-spacing: 0.5px;\n  }\n  .title
+    { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.3px; }\n  .subtitle
+    { font-size: 13px; color: var(--muted); margin: 4px 0 0; }\n  .header-links a
+    {\n    color: var(--cyan);\n    text-decoration: none;\n    font-size: 13px;\n    font-weight:
+    600;\n    background: rgba(255, 255, 255, 0.04);\n    border: 1px solid var(--card-border);\n    padding:
+    8px 16px;\n    border-radius: 8px;\n    transition: all 0.2s ease;\n  }\n  .header-links
+    a:hover { background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248,
+    0.3); }\n\n  /* Action Hero Box */\n  .action-bar {\n    background: linear-gradient(135deg,
+    rgba(13, 18, 29, 0.9) 0%, rgba(17, 24, 39, 0.9) 100%);\n    border: 1px solid
+    var(--card-border);\n    border-radius: 14px;\n    padding: 20px 24px;\n    display:
+    flex;\n    justify-content: space-between;\n    align-items: center;\n    margin-bottom:
+    24px;\n    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);\n    position: relative;\n    overflow:
+    hidden;\n  }\n  .action-bar::before {\n    content: \"\";\n    position: absolute;\n    top:
+    0; left: 0; right: 0; height: 1px;\n    background: linear-gradient(90deg, transparent,
+    rgba(56, 189, 248, 0.4), transparent);\n  }\n  .action-info h3 { margin: 0 0 4px;
+    font-size: 16px; font-weight: 600; }\n  .action-info p { margin: 0; font-size:
+    13px; color: var(--muted); }\n  .action-controls { display: flex; align-items:
+    center; gap: 12px; }\n  .btn-trigger {\n    border-radius: 10px;\n    padding:
+    12px 20px;\n    font-size: 13px;\n    font-weight: 600;\n    cursor: pointer;\n    transition:
+    all 0.2s ease;\n    display: flex;\n    align-items: center;\n    gap: 8px;\n  }\n  .btn-criu
+    {\n    background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);\n    color:
+    #ffffff;\n    border: 1px solid rgba(56, 189, 248, 0.4);\n    box-shadow: 0 4px
+    14px rgba(2, 132, 199, 0.35);\n  }\n  .btn-criu:hover:not(:disabled) {\n    background:
+    linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);\n    box-shadow: 0 6px 20px
+    rgba(56, 189, 248, 0.45);\n    transform: translateY(-1px);\n  }\n  .btn-native
+    {\n    background: linear-gradient(135deg, #991b1b 0%, #7f1d1d 100%);\n    color:
+    #ffffff;\n    border: 1px solid rgba(239, 68, 68, 0.4);\n    box-shadow: 0 4px
+    14px rgba(185, 28, 28, 0.35);\n  }\n  .btn-native:hover:not(:disabled) {\n    background:
+    linear-gradient(135deg, #ef4444 0%, #b91c1c 100%);\n    box-shadow: 0 6px 20px
+    rgba(239, 68, 68, 0.45);\n    transform: translateY(-1px);\n  }\n  .btn-trigger:disabled
+    {\n    opacity: 0.5;\n    cursor: not-allowed;\n    transform: none;\n    box-shadow:
+    none;\n  }\n\n  /* Metrics Grid */\n  .grid { display: grid; grid-template-columns:
+    repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }\n  .card {\n    background:
+    var(--card);\n    border: 1px solid var(--card-border);\n    border-radius: 12px;\n    padding:
+    18px 20px;\n    position: relative;\n    transition: border-color 0.2s ease;\n  }\n  .card:hover
+    { border-color: var(--card-hover); }\n  .card-label {\n    font-size: 11px;\n    font-family:
+    var(--font-mono);\n    color: var(--muted);\n    text-transform: uppercase;\n    letter-spacing:
+    0.5px;\n    margin-bottom: 8px;\n    display: flex;\n    align-items: center;\n    justify-content:
+    space-between;\n  }\n  .card-val {\n    font-size: 26px;\n    font-weight: 700;\n    font-family:
+    var(--font-mono);\n    color: var(--text);\n    letter-spacing: -0.5px;\n  }\n  .card-sub
+    { font-size: 12px; color: var(--muted); margin-top: 6px; }\n  .val-cyan { color:
+    var(--cyan); text-shadow: 0 0 20px rgba(56, 189, 248, 0.3); }\n  .val-emerald
+    { color: var(--emerald); text-shadow: 0 0 20px var(--emerald-glow); }\n  .pulse-dot
+    {\n    display: inline-block;\n    width: 8px;\n    height: 8px;\n    border-radius:
+    50%;\n    background: var(--emerald);\n    margin-right: 6px;\n    box-shadow:
+    0 0 10px var(--emerald);\n    animation: pulse 1.6s infinite ease-in-out;\n  }\n  @keyframes
+    pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform:
+    scale(0.85); } }\n\n  /* Pipeline Stepper */\n  .section-title { font-size: 14px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted);
+    margin: 0 0 12px; }\n  .pipeline { display: grid; grid-template-columns: repeat(4,
+    1fr); gap: 14px; margin-bottom: 24px; }\n  .step {\n    background: var(--card);\n    border:
+    1px solid var(--card-border);\n    border-radius: 12px;\n    padding: 16px;\n    position:
+    relative;\n    transition: all 0.3s ease;\n  }\n  .step.active {\n    border-color:
+    var(--emerald);\n    background: rgba(16, 185, 129, 0.05);\n    box-shadow: 0
+    0 15px rgba(16, 185, 129, 0.15);\n  }\n  .step-header { display: flex; align-items:
+    center; justify-content: space-between; margin-bottom: 8px; }\n  .step-num {\n    font-family:
+    var(--font-mono);\n    font-size: 11px;\n    color: var(--cyan);\n    background:
+    rgba(56, 189, 248, 0.1);\n    padding: 2px 6px;\n    border-radius: 4px;\n  }\n  .step-title
+    { font-size: 13px; font-weight: 600; margin: 0; }\n  .step-desc { font-size: 12px;
+    color: var(--muted); margin: 6px 0 0; line-height: 1.4; }\n\n  /* Audit Table
+    */\n  .table-wrap {\n    background: var(--card);\n    border: 1px solid var(--card-border);\n    border-radius:
+    12px;\n    padding: 20px;\n    overflow-x: auto;\n  }\n  table { width: 100%;
+    border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }\n  th
+    { text-align: left; padding: 12px; color: var(--muted); border-bottom: 1px solid
+    var(--card-border); font-weight: 600; text-transform: uppercase; font-size: 11px;
+    }\n  td { padding: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); }\n  .badge-success
+    {\n    background: rgba(16, 185, 129, 0.12);\n    color: var(--emerald);\n    border:
+    1px solid rgba(16, 185, 129, 0.3);\n    padding: 3px 8px;\n    border-radius:
+    6px;\n    font-weight: 600;\n    font-size: 11px;\n  }\n  .empty-state { text-align:
+    center; color: var(--muted); padding: 24px; font-style: italic; }\n  \n  /* Benchmark
+    Comparison */\n  .bench-grid { display: grid; grid-template-columns: 1fr 1fr;
+    gap: 16px; margin-bottom: 24px; }\n  .bench-card {\n    border-radius: 12px;\n    padding:
+    20px;\n    position: relative;\n    background: var(--card);\n    border: 1px
+    solid var(--card-border);\n  }\n  .bench-ours {\n    border-color: rgba(16, 185,
+    129, 0.4);\n    background: linear-gradient(180deg, rgba(16, 185, 129, 0.06) 0%,
+    rgba(13, 18, 29, 0.9) 100%);\n    box-shadow: 0 4px 20px rgba(16, 185, 129, 0.1);\n  }\n  .bench-native
+    {\n    border-color: rgba(239, 68, 68, 0.4);\n    background: linear-gradient(180deg,
+    rgba(239, 68, 68, 0.06) 0%, rgba(13, 18, 29, 0.9) 100%);\n    box-shadow: 0 4px
+    20px rgba(239, 68, 68, 0.1);\n  }\n  .bench-badge {\n    display: inline-block;\n    font-family:
+    var(--font-mono);\n    font-size: 11px;\n    font-weight: 700;\n    padding: 4px
+    10px;\n    border-radius: 6px;\n    letter-spacing: 0.5px;\n  }\n  .badge-green
+    { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16,
+    185, 129, 0.3); }\n  .badge-red { background: rgba(239, 68, 68, 0.15); color:
+    #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }\n  .bench-metric { display:
+    flex; align-items: baseline; gap: 12px; margin: 14px 0 12px; }\n  .bench-num {
+    font-size: 38px; font-weight: 800; font-family: var(--font-mono); }\n  .val-crimson
+    { color: #ef4444; text-shadow: 0 0 20px rgba(239, 68, 68, 0.3); }\n  .bench-label
+    { font-size: 14px; font-weight: 600; color: var(--text); }\n  .bench-details {
+    list-style: none; padding: 0; margin: 0; font-size: 12px; color: var(--muted);
+    line-height: 1.8; }\n  .bench-details li strong { color: var(--text); font-weight:
+    600; }\n\n  /* Status Toast */\n  #toast {\n    position: fixed;\n    bottom:
+    24px;\n    right: 24px;\n    background: #0f172a;\n    border: 1px solid var(--cyan);\n    color:
+    #f8fafc;\n    padding: 12px 18px;\n    border-radius: 10px;\n    box-shadow: 0
+    10px 25px rgba(0,0,0,0.5);\n    font-size: 13px;\n    display: none;\n    z-index:
+    100;\n  }\n</style>\n</head>\n<body>\n<div class=\"container\">\n  <header class=\"header\">\n    <div
+    class=\"brand\">\n      <span class=\"brand-badge\">CILIUM eBPF &times; CRIU</span>\n      <div>\n        <h1
+    class=\"title\">Stateful Container Live Migration Console</h1>\n        <p class=\"subtitle\">Zero-downtime
+    memory freeze, OCI layer streaming &amp; eBPF socket retargeting</p>\n      </div>\n    </div>\n    <div
+    class=\"header-links\">\n      <a href=\"/\">Storefront Demo &rarr;</a>\n    </div>\n  </header>\n\n  <div
+    class=\"action-bar\">\n    <div class=\"action-info\">\n      <h3>Live Execution
+    Sandbox &amp; Interactive Benchmark</h3>\n      <p>Execute zero-loss CRIU stateful
+    migration vs standard Kubernetes cold pod eviction</p>\n    </div>\n    <div class=\"action-controls\">\n      <button
+    id=\"btn_criu\" class=\"btn-trigger btn-criu\" onclick=\"triggerCriuMigration()\"
+    title=\"Migrates container preserving full volatile heap memory\">\n        <span
+    id=\"criu_icon\">&#9889;</span>\n        <span id=\"criu_text\">Stateful Migration
+    (CRIU)</span>\n      </button>\n      <button id=\"btn_native\" class=\"btn-trigger
+    btn-native\" onclick=\"triggerNativeReschedule()\" title=\"Simulates native K8s
+    pod eviction without CRIU (resets memory to 0)\">\n        <span id=\"native_icon\">&#10052;</span>\n        <span
+    id=\"native_text\">Native K8s Reschedule</span>\n      </button>\n    </div>\n  </div>\n\n  <div
+    class=\"grid\">\n    <div class=\"card\">\n      <div class=\"card-label\"><span>In-Memory
+    State (RAM)</span><span>10 Hz</span></div>\n      <div class=\"card-val val-cyan\"
+    id=\"counter\">0</div>\n      <div class=\"card-sub\">Volatile heap state counter</div>\n    </div>\n    <div
+    class=\"card\">\n      <div class=\"card-label\"><span>Active Execution Node</span><span>AWS
+    EC2</span></div>\n      <div class=\"card-val val-emerald\"><span class=\"pulse-dot\"></span><span
+    id=\"node\">...</span></div>\n      <div class=\"card-sub\" id=\"target_hint\">Target:
+    evaluating...</div>\n    </div>\n    <div class=\"card\">\n      <div class=\"card-label\"><span>Container
+    Endpoint &amp; PID</span><span>Cilium CNI</span></div>\n      <div class=\"card-val\"
+    style=\"font-size: 17px; margin-top: 6px;\" id=\"pod_ip\">...</div>\n      <div
+    class=\"card-sub\">eBPF socket load-balanced</div>\n    </div>\n    <div class=\"card\">\n      <div
+    class=\"card-label\"><span>Client HTTP Blackout</span><span>50 Hz Prober</span></div>\n      <div
+    class=\"card-val\" id=\"max_gap\">0 ms</div>\n      <div class=\"card-sub\">Real
+    client perceived downtime</div>\n    </div>\n  </div>\n\n  <div class=\"section-title\">4-Stage
+    Stateful Migration Pipeline</div>\n  <div class=\"pipeline\">\n    <div class=\"step\"
+    id=\"st1\">\n      <div class=\"step-header\"><span class=\"step-title\">1. Kernel
+    Memory Freeze</span><span class=\"step-num\">CRIU</span></div>\n      <p class=\"step-desc\">Kubelet
+    checkpoint API triggers CRIU to dump memory pages into tarball (T_dump ~136ms).</p>\n    </div>\n    <div
+    class=\"step\" id=\"st2\">\n      <div class=\"step-header\"><span class=\"step-title\">2.
+    OCI Layer Assembly</span><span class=\"step-num\">Buildah</span></div>\n      <p
+    class=\"step-desc\">Packs RAM checkpoint archive into standard OCI layer with
+    CRI-O metadata (T_build ~357ms).</p>\n    </div>\n    <div class=\"step\" id=\"st3\">\n      <div
+    class=\"step-header\"><span class=\"step-title\">3. Wire Transfer</span><span
+    class=\"step-num\">Registry</span></div>\n      <p class=\"step-desc\">Streams
+    checkpoint image to local cluster registry on master node (T_push ~284ms).</p>\n    </div>\n    <div
+    class=\"step\" id=\"st4\">\n      <div class=\"step-header\"><span class=\"step-title\">4.
+    Rehydration &amp; eBPF</span><span class=\"step-num\">CRI-O</span></div>\n      <p
+    class=\"step-desc\">CRI-O unfreezes process via runc/criu; Cilium eBPF redirects
+    traffic to new IP (T_restore ~1113ms).</p>\n    </div>\n  </div>\n\n  <div class=\"section-title\">Architectural
+    Benchmark: Stateful Migration vs Native Kubernetes</div>\n  <div class=\"bench-grid\">\n    <div
+    class=\"bench-card bench-ours\">\n      <div class=\"bench-badge badge-green\">PROPOSED:
+    CRI-O + CRIU + eBPF</div>\n      <div class=\"bench-metric\">\n        <span class=\"bench-num
+    val-emerald\">100%</span>\n        <span class=\"bench-label\">RAM State Preserved</span>\n      </div>\n      <ul
+    class=\"bench-details\">\n        <li><strong>Client HTTP Blackout:</strong> ~1,064
+    ms (P95: 1,125 ms)</li>\n        <li><strong>Volatile Memory:</strong> Preserves
+    heap, open TCP listening sockets &amp; process PID</li>\n        <li><strong>Application
+    Logic:</strong> Pure OS-level freeze &mdash; zero application code changes</li>\n        <li><strong>Reliability
+    Verdict:</strong> Verified state continuity across physical AWS nodes</li>\n      </ul>\n    </div>\n\n    <div
+    class=\"bench-card bench-native\">\n      <div class=\"bench-badge badge-red\">BASELINE:
+    NATIVE KUBERNETES RESCHEDULE</div>\n      <div class=\"bench-metric\">\n        <span
+    class=\"bench-num val-crimson\">0%</span>\n        <span class=\"bench-label\">RAM
+    State Lost (Reset to 0)</span>\n      </div>\n      <ul class=\"bench-details\">\n        <li><strong>Client
+    HTTP Blackout:</strong> ~1,126 ms (Identical or higher outage duration)</li>\n        <li><strong>Volatile
+    Memory:</strong> 100% data wiped on pod termination (Counter: 5,195 &rarr; 0)</li>\n        <li><strong>Application
+    Logic:</strong> Requires rewriting code to use external DB or disks</li>\n        <li><strong>Reliability
+    Verdict:</strong> Catastrophic state loss for real-time and in-memory sessions</li>\n      </ul>\n    </div>\n  </div>\n\n  <div
+    class=\"table-wrap\">\n    <div class=\"card-label\" style=\"margin-bottom: 14px;\">Operator
+    Audit Log (kubectl get podlivemigrations -n boutique)</div>\n    <table>\n      <thead>\n        <tr>\n          <th>Job
+    ID</th>\n          <th>Route</th>\n          <th>Trigger</th>\n          <th>Status</th>\n          <th>Pipeline
+    Duration</th>\n          <th>HTTP Blackout</th>\n          <th>Phase Breakdown
+    &amp; State Continuity</th>\n        </tr>\n      </thead>\n      <tbody id=\"plm_body\">\n        <tr><td
+    colspan=\"7\" class=\"empty-state\">No live migrations executed yet. Click \"Trigger
+    Live Migration\" above or run benchmark script.</td></tr>\n      </tbody>\n    </table>\n  </div>\n</div>\n\n<div
+    id=\"toast\"></div>\n\n<script>\n  let lastTs = performance.now(), maxGap = 0,
+    isMigrating = false, curActiveNode = \"\", activeMode = \"criu\";\n\n  function
+    showToast(msg, isWarn) {\n    const t = document.getElementById(''toast'');\n    t.innerText
+    = msg;\n    t.style.borderColor = isWarn ? ''#ef4444'' : ''var(--cyan)'';\n    t.style.display
+    = ''block'';\n    setTimeout(() => { t.style.display = ''none''; }, 5000);\n  }\n\n  async
+    function triggerCriuMigration() {\n    const btnCriu = document.getElementById(''btn_criu'');\n    const
+    btnNative = document.getElementById(''btn_native'');\n    btnCriu.disabled = true;\n    btnNative.disabled
+    = true;\n    isMigrating = true;\n    activeMode = ''criu'';\n    document.getElementById(''criu_text'').innerText
+    = ''Migrating via CRIU...'';\n    document.getElementById(''criu_icon'').innerText
+    = ''\u23f3'';\n    for (let i = 1; i <= 4; i++) document.getElementById(''st''
+    + i).classList.add(''active'');\n\n    try {\n      const resp = await fetch(''/live/migrate'',
+    { method: ''POST'' });\n      const data = await resp.json();\n      showToast(''\u26a1
+    CRIU pipeline dispatched: '' + data.source + '' \u2794 '' + data.target, false);\n    }
+    catch (err) {\n      showToast(''CRIU trigger sent: pipeline executing...'', false);\n    }\n  }\n\n  async
+    function triggerNativeReschedule() {\n    const btnCriu = document.getElementById(''btn_criu'');\n    const
+    btnNative = document.getElementById(''btn_native'');\n    btnCriu.disabled = true;\n    btnNative.disabled
+    = true;\n    isMigrating = true;\n    activeMode = ''native'';\n    document.getElementById(''native_text'').innerText
+    = ''Evicting pod...'';\n    document.getElementById(''native_icon'').innerText
+    = ''\u23f3'';\n    for (let i = 1; i <= 4; i++) document.getElementById(''st''
+    + i).classList.remove(''active'');\n\n    try {\n      const resp = await fetch(''/live/reschedule'',
+    { method: ''POST'' });\n      const data = await resp.json();\n      showToast(''\u2744\ufe0f
+    Native eviction dispatched: '' + data.source + '' \u2794 '' + data.target, true);\n    }
+    catch (err) {\n      showToast(''Native eviction sent: restarting container...'',
+    true);\n    }\n  }\n\n  async function poll() {\n    try {\n      const r = await
+    fetch(''/live/state'', { cache: ''no-store'' });\n      const d = await r.json();\n      const
+    now = performance.now(), gap = Math.round(now - lastTs);\n      if (gap > maxGap
+    && lastTs > 0 && maxGap < 60000) maxGap = gap;\n      lastTs = now;\n\n      document.getElementById(''counter'').innerText
+    = Number(d.ram_counter).toLocaleString();\n      document.getElementById(''node'').innerText
+    = d.node;\n      document.getElementById(''pod_ip'').innerText = d.pod_ip + ''
+    (PID '' + d.pid + '')'';\n      \n      if (maxGap > 0 && maxGap < 60000) {\n        document.getElementById(''max_gap'').innerText
+    = maxGap + '' ms'';\n      }\n\n      const targetNode = (d.node === ''k8s-worker-1'')
+    ? ''k8s-worker-2'' : ''k8s-worker-1'';\n      document.getElementById(''target_hint'').innerText
+    = ''Next Target: '' + targetNode;\n\n      if (curActiveNode && curActiveNode
+    !== d.node && isMigrating) {\n        isMigrating = false;\n        document.getElementById(''btn_criu'').disabled
+    = false;\n        document.getElementById(''btn_native'').disabled = false;\n        document.getElementById(''criu_text'').innerText
+    = ''Stateful Migration (CRIU)'';\n        document.getElementById(''criu_icon'').innerText
+    = ''\u26a1'';\n        document.getElementById(''native_text'').innerText = ''Native
+    K8s Reschedule'';\n        document.getElementById(''native_icon'').innerText
+    = ''\u2744\ufe0f'';\n        if (activeMode === ''native'') {\n          showToast(''\u26a0\ufe0f
+    Native Reschedule Complete: Memory wiped to 0 (100% data loss)!'', true);\n        }
+    else {\n          showToast(''\u2713 CRIU Stateful Migration Complete: Memory
+    preserved across nodes!'', false);\n        }\n      }\n      curActiveNode =
+    d.node;\n\n      if (d.migrations && d.migrations.length > 0) {\n        document.getElementById(''plm_body'').innerHTML
+    = d.migrations.map(m => {\n          const isCold = m.reason && m.reason.includes(''Native'');\n          const
+    badgeClass = isCold ? ''badge-red'' : ''badge-success'';\n          return `\n          <tr>\n            <td
+    style=\"color:${isCold ? ''#ef4444'' : ''var(--cyan)''};font-weight:600;\">${m.name}</td>\n            <td>${m.source}
+    &rarr; ${m.target}</td>\n            <td><span style=\"color:#94a3b8;\">${m.reason}</span></td>\n            <td><span
+    class=\"${badgeClass}\">${m.phase}</span></td>\n            <td style=\"font-weight:700;\">${m.duration}</td>\n            <td
+    style=\"color:#f59e0b;font-weight:700;\">${m.blackout}</td>\n            <td style=\"font-size:11px;color:${isCold
+    ? ''#fca5a5'' : ''#cbd5e1''};\">${m.breakdown}</td>\n          </tr>\n        `}).join('''');\n      }\n    }
+    catch (e) {\n      // Network disconnect during migration cutover\n    }\n    setTimeout(poll,
+    200);\n  }\n  poll();\n</script>\n</body></html>\"\"\"\n\nclass H(http.server.BaseHTTPRequestHandler):\n    protocol_version
+    = \"HTTP/1.0\"\n    def log_message(self, *a): return\n    def do_GET(self):\n        if
+    self.path.startswith(\"/live/state\"):\n            body = json.dumps({\n                \"ram_counter\":
+    STATE[\"ram_counter\"],\n                \"node\": STATE[\"node\"],\n                \"pod_ip\":
+    get_current_pod_ip(),\n                \"pid\": STATE[\"pid\"],\n                \"migrations\":
+    STATE[\"migrations\"],\n            }).encode(\"utf-8\")\n            self.send_response(200)\n            self.send_header(\"Content-Type\",
+    \"application/json\")\n            self.send_header(\"Connection\", \"close\")\n            self.end_headers()\n            self.wfile.write(body)\n        else:\n            self.send_response(200)\n            self.send_header(\"Content-Type\",
+    \"text/html; charset=utf-8\")\n            self.send_header(\"Connection\", \"close\")\n            self.end_headers()\n            self.wfile.write(HTML.encode(\"utf-8\"))\n\n    def
+    do_POST(self):\n        if self.path.startswith(\"/live/migrate\") or self.path.startswith(\"/live/reschedule\"):\n            endpoint
+    = \"trigger\" if self.path.startswith(\"/live/migrate\") else \"reschedule\"\n            try:\n                req
+    = urllib.request.Request(\n                    f\"http://migration-trigger-api.boutique.svc.cluster.local:8080/{endpoint}\",\n                    data=b\"{}\",\n                    headers={\"Content-Type\":
+    \"application/json\"},\n                    method=\"POST\",\n                )\n                with
+    urllib.request.urlopen(req, timeout=30) as resp:\n                    res_data
+    = resp.read()\n                    self.send_response(200)\n                    self.send_header(\"Content-Type\",
+    \"application/json\")\n                    self.send_header(\"Connection\", \"close\")\n                    self.end_headers()\n                    self.wfile.write(res_data)\n            except
+    Exception as err:\n                self.send_response(500)\n                self.send_header(\"Content-Type\",
+    \"application/json\")\n                self.send_header(\"Connection\", \"close\")\n                self.end_headers()\n                self.wfile.write(json.dumps({\"error\":
+    str(err)}).encode(\"utf-8\"))\n            return\n\n        # \u0417\u0430\u043f\u0438\u0441\u044c
+    \u043f\u0440\u0438\u043d\u0438\u043c\u0430\u0435\u0442\u0441\u044f \u0442\u043e\u043b\u044c\u043a\u043e
+    \u043d\u0430\u043f\u0440\u044f\u043c\u0443\u044e \u043e\u0442 \u043e\u043f\u0435\u0440\u0430\u0442\u043e\u0440\u0430.
+    \u0417\u0430\u043f\u0440\u043e\u0441\u044b \u0447\u0435\u0440\u0435\u0437 Ingress
+    (Envoy) \u043d\u0435\u0441\u0443\u0442\n        # \u0437\u0430\u0433\u043e\u043b\u043e\u0432\u043e\u043a
+    X-Forwarded-For / X-Envoy-External-Address \u0438 \u043e\u0442\u043a\u043b\u043e\u043d\u044f\u044e\u0442\u0441\u044f.\n        if
+    self.headers.get(\"X-Forwarded-For\") or self.headers.get(\"X-Envoy-External-Address\"):\n            self.send_response(403)\n            self.send_header(\"Connection\",
+    \"close\")\n            self.end_headers()\n            return\n        if self.path.startswith(\"/live/record\"):\n            length
+    = int(self.headers.get(\"Content-Length\", \"0\"))\n            payload = json.loads(self.rfile.read(length).decode(\"utf-8\"))\n            STATE[\"node\"]
+    = payload.get(\"target\", STATE[\"node\"])\n            STATE[\"migrations\"].append(payload)\n            self.send_response(200)\n            self.send_header(\"Content-Type\",
+    \"application/json\")\n            self.send_header(\"Connection\", \"close\")\n            self.end_headers()\n            self.wfile.write(b''{\"ok\":true}'')\n\nhttp.server.ThreadingHTTPServer((\"0.0.0.0\",
+    8090), H).serve_forever()\n"], "ports": [{"containerPort": 8090}]}]}}'
+kind: ConfigMap
+metadata:
+  name: live-stream-template
+  namespace: boutique

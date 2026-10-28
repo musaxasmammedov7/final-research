@@ -580,15 +580,12 @@ spec:
                                   except Exception:
                                       break
 
-                              # Recreate clean pod on target node
-                              spec = pod["spec"]
-                              spec["nodeName"] = target
-                              new_pod = {
-                                  "apiVersion": "v1",
-                                  "kind": "Pod",
-                                  "metadata": {"name": "live-stream-pod", "namespace": "boutique", "labels": {"app": "live-stream"}},
-                                  "spec": spec
-                              }
+                              # Recreate clean pod on target node from clean template (no CRIU checkpoint)
+                              cm = k8s("/api/v1/namespaces/boutique/configmaps/live-stream-template")
+                              new_pod = json.loads(cm["data"]["pod.json"])
+                              new_pod["metadata"]["name"] = "live-stream-pod"
+                              new_pod["metadata"]["namespace"] = "boutique"
+                              new_pod["spec"]["nodeName"] = target
                               k8s("/api/v1/namespaces/boutique/pods", method="POST", body=new_pod)
 
                               after_val = 0
