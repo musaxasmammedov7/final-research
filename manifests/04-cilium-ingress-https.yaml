@@ -1,0 +1,37 @@
+# ==============================================================================
+# Cilium Service Mesh Ingress + Automated Let's Encrypt HTTPS Certificate
+# Routes:
+#   https://<DOMAIN>/      -> Google Online Boutique (11 microservices via frontend)
+#   https://<DOMAIN>/live  -> Stateful RAM Migration Console (CRI-O + CRIU + Buildah)
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: boutique-cilium-ingress
+  namespace: boutique
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: cilium
+  tls:
+    - hosts:
+        - musa-research.duckdns.org
+      secretName: boutique-tls-cert
+  rules:
+    - host: musa-research.duckdns.org
+      http:
+        paths:
+          - path: /live
+            pathType: Prefix
+            backend:
+              service:
+                name: live-stream-service
+                port:
+                  number: 8090
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
