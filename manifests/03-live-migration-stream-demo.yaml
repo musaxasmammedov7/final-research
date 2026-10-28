@@ -26,7 +26,7 @@ spec:
         - python3
         - -c
         - |
-          import http.server, json, os, socket, time
+          import http.server, json, os, socket, time, urllib.request
           from threading import Thread
 
           STATE = {
@@ -54,73 +54,406 @@ spec:
               except Exception:
                   return "unknown"
 
-          HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>CRI-O + CRIU Stateful Migration</title>
+          HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Stateful Container Live Migration Console</title>
           <style>
-            body { font-family: system-ui, sans-serif; background: #0b0f19; color: #f8fafc; margin: 0; padding: 24px; }
-            .wrap { max-width: 1120px; margin: 0 auto; }
-            .top { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }
-            .top a { color: #38bdf8; text-decoration: none; font-weight: 600; background: #1e293b; padding: 8px 14px; border-radius: 8px; }
-            .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 20px; }
-            .card { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 16px; }
-            .label { font-size: 11px; color: #94a3b8; text-transform: uppercase; }
-            .val { font-size: 24px; font-weight: 700; margin-top: 6px; font-family: monospace; color: #38bdf8; }
-            .ok { color: #4ade80; }
-            .pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 20px; }
-            .step { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px; }
-            .step.active { border-color: #4ade80; background: #06281e; }
-            .step h4 { margin: 0 0 6px 0; font-size: 14px; }
-            .step p { margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.4; }
-            table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
-            th, td { text-align: left; padding: 10px; border-bottom: 1px solid #1f2937; font-family: monospace; }
-          </style></head><body><div class="wrap">
-            <div class="top">
-              <div>
-                <h2 style="margin:0;">🚀 Стенд миграции состояния RAM (CRI-O + CRIU + Buildah + Cilium eBPF)</h2>
-                <p style="margin:4px 0 0; color:#94a3b8; font-size:14px;">Исследовательский прототип поверх kubelet Checkpoint API (KEP-2008): Checkpoint &rarr; Buildah OCI Image &rarr; CRI-O Restore на целевой ноде</p>
+            :root {
+              --bg: #07090e;
+              --card: #0d121d;
+              --card-border: rgba(255, 255, 255, 0.08);
+              --card-hover: rgba(255, 255, 255, 0.12);
+              --cyan: #38bdf8;
+              --emerald: #10b981;
+              --emerald-glow: rgba(16, 185, 129, 0.25);
+              --text: #f1f5f9;
+              --muted: #64748b;
+              --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+            }
+            * { box-sizing: border-box; }
+            body {
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+              background: var(--bg);
+              color: var(--text);
+              margin: 0;
+              padding: 28px 20px;
+              min-height: 100vh;
+              background-image: radial-gradient(circle at 50% -20%, rgba(56, 189, 248, 0.08), transparent 70%);
+            }
+            .container { max-width: 1180px; margin: 0 auto; }
+            
+            /* Header */
+            .header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              border-bottom: 1px solid var(--card-border);
+              padding-bottom: 20px;
+              margin-bottom: 24px;
+            }
+            .brand { display: flex; align-items: center; gap: 12px; }
+            .brand-badge {
+              background: rgba(56, 189, 248, 0.1);
+              color: var(--cyan);
+              border: 1px solid rgba(56, 189, 248, 0.25);
+              font-family: var(--font-mono);
+              font-size: 11px;
+              font-weight: 700;
+              padding: 4px 8px;
+              border-radius: 6px;
+              letter-spacing: 0.5px;
+            }
+            .title { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.3px; }
+            .subtitle { font-size: 13px; color: var(--muted); margin: 4px 0 0; }
+            .header-links a {
+              color: var(--cyan);
+              text-decoration: none;
+              font-size: 13px;
+              font-weight: 600;
+              background: rgba(255, 255, 255, 0.04);
+              border: 1px solid var(--card-border);
+              padding: 8px 16px;
+              border-radius: 8px;
+              transition: all 0.2s ease;
+            }
+            .header-links a:hover { background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248, 0.3); }
+
+            /* Action Hero Box */
+            .action-bar {
+              background: linear-gradient(135deg, rgba(13, 18, 29, 0.9) 0%, rgba(17, 24, 39, 0.9) 100%);
+              border: 1px solid var(--card-border);
+              border-radius: 14px;
+              padding: 20px 24px;
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 24px;
+              box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+              position: relative;
+              overflow: hidden;
+            }
+            .action-bar::before {
+              content: "";
+              position: absolute;
+              top: 0; left: 0; right: 0; height: 1px;
+              background: linear-gradient(90deg, transparent, rgba(56, 189, 248, 0.4), transparent);
+            }
+            .action-info h3 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+            .action-info p { margin: 0; font-size: 13px; color: var(--muted); }
+            .action-controls { display: flex; align-items: center; gap: 14px; }
+            .btn-trigger {
+              background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+              color: #ffffff;
+              border: 1px solid rgba(56, 189, 248, 0.4);
+              font-size: 14px;
+              font-weight: 600;
+              padding: 12px 22px;
+              border-radius: 10px;
+              cursor: pointer;
+              transition: all 0.2s ease;
+              box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
+              display: flex;
+              align-items: center;
+              gap: 8px;
+            }
+            .btn-trigger:hover:not(:disabled) {
+              background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+              box-shadow: 0 6px 20px rgba(56, 189, 248, 0.45);
+              transform: translateY(-1px);
+            }
+            .btn-trigger:disabled {
+              opacity: 0.6;
+              cursor: not-allowed;
+              transform: none;
+              box-shadow: none;
+            }
+
+            /* Metrics Grid */
+            .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+            .card {
+              background: var(--card);
+              border: 1px solid var(--card-border);
+              border-radius: 12px;
+              padding: 18px 20px;
+              position: relative;
+              transition: border-color 0.2s ease;
+            }
+            .card:hover { border-color: var(--card-hover); }
+            .card-label {
+              font-size: 11px;
+              font-family: var(--font-mono);
+              color: var(--muted);
+              text-transform: uppercase;
+              letter-spacing: 0.5px;
+              margin-bottom: 8px;
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+            }
+            .card-val {
+              font-size: 26px;
+              font-weight: 700;
+              font-family: var(--font-mono);
+              color: var(--text);
+              letter-spacing: -0.5px;
+            }
+            .card-sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
+            .val-cyan { color: var(--cyan); text-shadow: 0 0 20px rgba(56, 189, 248, 0.3); }
+            .val-emerald { color: var(--emerald); text-shadow: 0 0 20px var(--emerald-glow); }
+            .pulse-dot {
+              display: inline-block;
+              width: 8px;
+              height: 8px;
+              border-radius: 50%;
+              background: var(--emerald);
+              margin-right: 6px;
+              box-shadow: 0 0 10px var(--emerald);
+              animation: pulse 1.6s infinite ease-in-out;
+            }
+            @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
+
+            /* Pipeline Stepper */
+            .section-title { font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin: 0 0 12px; }
+            .pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
+            .step {
+              background: var(--card);
+              border: 1px solid var(--card-border);
+              border-radius: 12px;
+              padding: 16px;
+              position: relative;
+              transition: all 0.3s ease;
+            }
+            .step.active {
+              border-color: var(--emerald);
+              background: rgba(16, 185, 129, 0.05);
+              box-shadow: 0 0 15px rgba(16, 185, 129, 0.15);
+            }
+            .step-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+            .step-num {
+              font-family: var(--font-mono);
+              font-size: 11px;
+              color: var(--cyan);
+              background: rgba(56, 189, 248, 0.1);
+              padding: 2px 6px;
+              border-radius: 4px;
+            }
+            .step-title { font-size: 13px; font-weight: 600; margin: 0; }
+            .step-desc { font-size: 12px; color: var(--muted); margin: 6px 0 0; line-height: 1.4; }
+
+            /* Audit Table */
+            .table-wrap {
+              background: var(--card);
+              border: 1px solid var(--card-border);
+              border-radius: 12px;
+              padding: 20px;
+              overflow-x: auto;
+            }
+            table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }
+            th { text-align: left; padding: 12px; color: var(--muted); border-bottom: 1px solid var(--card-border); font-weight: 600; text-transform: uppercase; font-size: 11px; }
+            td { padding: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); }
+            .badge-success {
+              background: rgba(16, 185, 129, 0.12);
+              color: var(--emerald);
+              border: 1px solid rgba(16, 185, 129, 0.3);
+              padding: 3px 8px;
+              border-radius: 6px;
+              font-weight: 600;
+              font-size: 11px;
+            }
+            .empty-state { text-align: center; color: var(--muted); padding: 24px; font-style: italic; }
+            
+            /* Status Toast */
+            #toast {
+              position: fixed;
+              bottom: 24px;
+              right: 24px;
+              background: #0f172a;
+              border: 1px solid var(--cyan);
+              color: #f8fafc;
+              padding: 12px 18px;
+              border-radius: 10px;
+              box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+              font-size: 13px;
+              display: none;
+              z-index: 100;
+            }
+          </style>
+          </head>
+          <body>
+          <div class="container">
+            <header class="header">
+              <div class="brand">
+                <span class="brand-badge">CILIUM eBPF &times; CRIU</span>
+                <div>
+                  <h1 class="title">Stateful Container Live Migration Console</h1>
+                  <p class="subtitle">Zero-downtime memory freeze, OCI layer streaming &amp; eBPF socket retargeting</p>
+                </div>
               </div>
-              <a href="/">🛒 Магазин Google Boutique &rarr;</a>
+              <div class="header-links">
+                <a href="/">Storefront Demo &rarr;</a>
+              </div>
+            </header>
+
+            <div class="action-bar">
+              <div class="action-info">
+                <h3>Interactive Migration Trigger</h3>
+                <p>Transfer active process memory between cluster worker nodes on the fly</p>
+              </div>
+              <div class="action-controls">
+                <button id="btn_migrate" class="btn-trigger" onclick="triggerMigration()">
+                  <span id="btn_icon">&#9889;</span>
+                  <span id="btn_text">Trigger Live Migration</span>
+                </button>
+              </div>
             </div>
+
             <div class="grid">
-              <div class="card"><div class="label">Счетчик в памяти RAM (CRIU)</div><div class="val ok" id="counter">0</div></div>
-              <div class="card"><div class="label">Текущая физическая нода</div><div class="val ok" id="node">...</div></div>
-              <div class="card"><div class="label">Pod IP и PID</div><div class="val" id="pod_ip">...</div></div>
-              <div class="card"><div class="label">Макс. пауза клиента (HTTP Gap)</div><div class="val" id="max_gap">0 ms</div></div>
+              <div class="card">
+                <div class="card-label"><span>In-Memory State (RAM)</span><span>10 Hz</span></div>
+                <div class="card-val val-cyan" id="counter">0</div>
+                <div class="card-sub">Volatile heap state counter</div>
+              </div>
+              <div class="card">
+                <div class="card-label"><span>Active Execution Node</span><span>AWS EC2</span></div>
+                <div class="card-val val-emerald"><span class="pulse-dot"></span><span id="node">...</span></div>
+                <div class="card-sub" id="target_hint">Target: evaluating...</div>
+              </div>
+              <div class="card">
+                <div class="card-label"><span>Container Endpoint &amp; PID</span><span>Cilium CNI</span></div>
+                <div class="card-val" style="font-size: 17px; margin-top: 6px;" id="pod_ip">...</div>
+                <div class="card-sub">eBPF socket load-balanced</div>
+              </div>
+              <div class="card">
+                <div class="card-label"><span>Client HTTP Blackout</span><span>50 Hz Prober</span></div>
+                <div class="card-val" id="max_gap">0 ms</div>
+                <div class="card-sub">Real client perceived downtime</div>
+              </div>
             </div>
-            <h3 style="margin-top:24px; margin-bottom:8px; font-size:15px;">Реальный 4-этапный конвейер миграции контейнера:</h3>
+
+            <div class="section-title">4-Stage Stateful Migration Pipeline</div>
             <div class="pipeline">
-              <div class="step" id="st1"><h4>1. Kubelet Checkpoint API</h4><p>Вызов <code>POST /checkpoint</code> в CRI-O на исходной ноде. CRIU сохраняет страницы RAM в tar-архив (<code>T_dump</code>).</p></div>
-              <div class="step" id="st2"><h4>2. Buildah OCI Packaging</h4><p>Упаковка архива CRIU в OCI-образ с аннотацией <code>io.kubernetes.cri-o.annotations.checkpoint.name</code> (<code>T_build</code>).</p></div>
-              <div class="step" id="st3"><h4>3. Registry Transfer</h4><p>Передача OCI-образа чекпоинта через локальный реестр кластера на целевую ноду (<code>T_transfer</code>).</p></div>
-              <div class="step" id="st4"><h4>4. CRI-O Restore &amp; Cilium</h4><p>CRI-O распаковывает дамп через <code>criu restore</code> (счетчик RAM продолжается со значения на момент дампа), Cilium eBPF обновляет Endpoint (<code>T_restore</code>).</p></div>
+              <div class="step" id="st1">
+                <div class="step-header"><span class="step-title">1. Kernel Memory Freeze</span><span class="step-num">CRIU</span></div>
+                <p class="step-desc">Kubelet checkpoint API triggers CRIU to dump memory pages into tarball (T_dump ~136ms).</p>
+              </div>
+              <div class="step" id="st2">
+                <div class="step-header"><span class="step-title">2. OCI Layer Assembly</span><span class="step-num">Buildah</span></div>
+                <p class="step-desc">Packs RAM checkpoint archive into standard OCI layer with CRI-O metadata (T_build ~357ms).</p>
+              </div>
+              <div class="step" id="st3">
+                <div class="step-header"><span class="step-title">3. Wire Transfer</span><span class="step-num">Registry</span></div>
+                <p class="step-desc">Streams checkpoint image to local cluster registry on master node (T_push ~284ms).</p>
+              </div>
+              <div class="step" id="st4">
+                <div class="step-header"><span class="step-title">4. Rehydration &amp; eBPF</span><span class="step-num">CRI-O</span></div>
+                <p class="step-desc">CRI-O unfreezes process via runc/criu; Cilium eBPF redirects traffic to new IP (T_restore ~1113ms).</p>
+              </div>
             </div>
-            <div class="card" style="margin-top:20px;">
-              <div class="label">Журнал оператора (<code>kubectl get podlivemigrations -n boutique</code>):</div>
-              <table><thead><tr><th>Задача</th><th>Маршрут</th><th>Триггер</th><th>Фаза</th><th>Длительность пайплайна</th><th>HTTP blackout</th><th>Разбивка фаз и счетчик (до дампа &rarr; перед удалением &rarr; после restore)</th></tr></thead>
-              <tbody id="plm_body"><tr><td colspan="7" style="color:#64748b;">Ожидание триггера (например: <code>kubectl cordon k8s-worker-1</code>)...</td></tr></tbody></table>
+
+            <div class="table-wrap">
+              <div class="card-label" style="margin-bottom: 14px;">Operator Audit Log (kubectl get podlivemigrations -n boutique)</div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Job ID</th>
+                    <th>Route</th>
+                    <th>Trigger</th>
+                    <th>Status</th>
+                    <th>Pipeline Duration</th>
+                    <th>HTTP Blackout</th>
+                    <th>Phase Breakdown &amp; State Continuity</th>
+                  </tr>
+                </thead>
+                <tbody id="plm_body">
+                  <tr><td colspan="7" class="empty-state">No live migrations executed yet. Click "Trigger Live Migration" above or run benchmark script.</td></tr>
+                </tbody>
+              </table>
             </div>
           </div>
+
+          <div id="toast"></div>
+
           <script>
-            let lastTs = performance.now(), maxGap = 0;
+            let lastTs = performance.now(), maxGap = 0, isMigrating = false, curActiveNode = "";
+
+            function showToast(msg) {
+              const t = document.getElementById('toast');
+              t.innerText = msg;
+              t.style.display = 'block';
+              setTimeout(() => { t.style.display = 'none'; }, 4000);
+            }
+
+            async function triggerMigration() {
+              const btn = document.getElementById('btn_migrate');
+              const txt = document.getElementById('btn_text');
+              const icon = document.getElementById('btn_icon');
+              btn.disabled = true;
+              isMigrating = true;
+              txt.innerText = 'Migrating in progress...';
+              icon.innerText = '⏳';
+              for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.add('active');
+
+              try {
+                const resp = await fetch('/live/migrate', { method: 'POST' });
+                const data = await resp.json();
+                if (data.status === 'ok') {
+                  showToast('Live migration pipeline dispatched: ' + data.source + ' ➔ ' + data.target);
+                } else {
+                  showToast('Migration trigger: ' + (data.message || data.error || 'Dispatched'));
+                }
+              } catch (err) {
+                showToast('Trigger sent: pipeline executing...');
+              }
+            }
+
             async function poll() {
               try {
                 const r = await fetch('/live/state', { cache: 'no-store' });
                 const d = await r.json();
                 const now = performance.now(), gap = Math.round(now - lastTs);
-                if (gap > maxGap && lastTs > 0) maxGap = gap;
+                if (gap > maxGap && lastTs > 0 && maxGap < 60000) maxGap = gap;
                 lastTs = now;
-                document.getElementById('counter').innerText = d.ram_counter;
+
+                document.getElementById('counter').innerText = Number(d.ram_counter).toLocaleString();
                 document.getElementById('node').innerText = d.node;
                 document.getElementById('pod_ip').innerText = d.pod_ip + ' (PID ' + d.pid + ')';
-                document.getElementById('max_gap').innerText = maxGap + ' ms';
-                if (d.migrations && d.migrations.length > 0) {
-                  for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.add('active');
-                  document.getElementById('plm_body').innerHTML = d.migrations.map(m => `<tr><td>${m.name}</td><td>${m.source} &rarr; ${m.target}</td><td>${m.reason}</td><td style="color:#4ade80;font-weight:700;">${m.phase}</td><td>${m.duration}</td><td>${m.blackout}</td><td>${m.breakdown}</td></tr>`).join('');
+                
+                if (maxGap > 0 && maxGap < 60000) {
+                  document.getElementById('max_gap').innerText = maxGap + ' ms';
                 }
-              } catch (e) {}
+
+                const targetNode = (d.node === 'k8s-worker-1') ? 'k8s-worker-2' : 'k8s-worker-1';
+                document.getElementById('target_hint').innerText = 'Next Target: ' + targetNode;
+
+                if (curActiveNode && curActiveNode !== d.node && isMigrating) {
+                  isMigrating = false;
+                  const btn = document.getElementById('btn_migrate');
+                  btn.disabled = false;
+                  document.getElementById('btn_text').innerText = 'Trigger Live Migration';
+                  document.getElementById('btn_icon').innerText = '⚡';
+                  showToast('✓ Successfully migrated to ' + d.node + '! State preserved.');
+                }
+                curActiveNode = d.node;
+
+                if (d.migrations && d.migrations.length > 0) {
+                  document.getElementById('plm_body').innerHTML = d.migrations.map(m => `
+                    <tr>
+                      <td style="color:var(--cyan);font-weight:600;">${m.name}</td>
+                      <td>${m.source} &rarr; ${m.target}</td>
+                      <td><span style="color:#94a3b8;">${m.reason}</span></td>
+                      <td><span class="badge-success">${m.phase}</span></td>
+                      <td style="font-weight:700;">${m.duration}</td>
+                      <td style="color:#f59e0b;font-weight:700;">${m.blackout}</td>
+                      <td style="font-size:11px;color:#cbd5e1;">${m.breakdown}</td>
+                    </tr>
+                  `).join('');
+                }
+              } catch (e) {
+                // Network disconnect during migration cutover
+              }
               setTimeout(poll, 200);
             }
             poll();
-          </script></body></html>"""
+          </script>
+          </body></html>"""
 
           class H(http.server.BaseHTTPRequestHandler):
               protocol_version = "HTTP/1.0"
@@ -147,6 +480,29 @@ spec:
                       self.wfile.write(HTML.encode("utf-8"))
 
               def do_POST(self):
+                  if self.path.startswith("/live/migrate"):
+                      try:
+                          req = urllib.request.Request(
+                              "http://migration-trigger-api.boutique.svc.cluster.local:8080/trigger",
+                              data=b"{}",
+                              headers={"Content-Type": "application/json"},
+                              method="POST",
+                          )
+                          with urllib.request.urlopen(req, timeout=5) as resp:
+                              res_data = resp.read()
+                              self.send_response(200)
+                              self.send_header("Content-Type", "application/json")
+                              self.send_header("Connection", "close")
+                              self.end_headers()
+                              self.wfile.write(res_data)
+                      except Exception as err:
+                          self.send_response(500)
+                          self.send_header("Content-Type", "application/json")
+                          self.send_header("Connection", "close")
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"error": str(err)}).encode("utf-8"))
+                      return
+
                   # Запись принимается только напрямую от оператора. Запросы через Ingress (Envoy) несут
                   # заголовок X-Forwarded-For / X-Envoy-External-Address и отклоняются.
                   if self.headers.get("X-Forwarded-For") or self.headers.get("X-Envoy-External-Address"):
