@@ -138,29 +138,42 @@ spec:
             }
             .action-info h3 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
             .action-info p { margin: 0; font-size: 13px; color: var(--muted); }
-            .action-controls { display: flex; align-items: center; gap: 14px; }
+            .action-controls { display: flex; align-items: center; gap: 12px; }
             .btn-trigger {
-              background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
-              color: #ffffff;
-              border: 1px solid rgba(56, 189, 248, 0.4);
-              font-size: 14px;
-              font-weight: 600;
-              padding: 12px 22px;
               border-radius: 10px;
+              padding: 12px 20px;
+              font-size: 13px;
+              font-weight: 600;
               cursor: pointer;
               transition: all 0.2s ease;
-              box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
               display: flex;
               align-items: center;
               gap: 8px;
             }
-            .btn-trigger:hover:not(:disabled) {
+            .btn-criu {
+              background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+              color: #ffffff;
+              border: 1px solid rgba(56, 189, 248, 0.4);
+              box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
+            }
+            .btn-criu:hover:not(:disabled) {
               background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
               box-shadow: 0 6px 20px rgba(56, 189, 248, 0.45);
               transform: translateY(-1px);
             }
+            .btn-native {
+              background: linear-gradient(135deg, #991b1b 0%, #7f1d1d 100%);
+              color: #ffffff;
+              border: 1px solid rgba(239, 68, 68, 0.4);
+              box-shadow: 0 4px 14px rgba(185, 28, 28, 0.35);
+            }
+            .btn-native:hover:not(:disabled) {
+              background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%);
+              box-shadow: 0 6px 20px rgba(239, 68, 68, 0.45);
+              transform: translateY(-1px);
+            }
             .btn-trigger:disabled {
-              opacity: 0.6;
+              opacity: 0.5;
               cursor: not-allowed;
               transform: none;
               box-shadow: none;
@@ -331,13 +344,17 @@ spec:
 
             <div class="action-bar">
               <div class="action-info">
-                <h3>Interactive Migration Trigger</h3>
-                <p>Transfer active process memory between cluster worker nodes on the fly</p>
+                <h3>Live Execution Sandbox &amp; Interactive Benchmark</h3>
+                <p>Execute zero-loss CRIU stateful migration vs standard Kubernetes cold pod eviction</p>
               </div>
               <div class="action-controls">
-                <button id="btn_migrate" class="btn-trigger" onclick="triggerMigration()">
-                  <span id="btn_icon">&#9889;</span>
-                  <span id="btn_text">Trigger Live Migration</span>
+                <button id="btn_criu" class="btn-trigger btn-criu" onclick="triggerCriuMigration()" title="Migrates container preserving full volatile heap memory">
+                  <span id="criu_icon">&#9889;</span>
+                  <span id="criu_text">Stateful Migration (CRIU)</span>
+                </button>
+                <button id="btn_native" class="btn-trigger btn-native" onclick="triggerNativeReschedule()" title="Simulates native K8s pod eviction without CRIU (resets memory to 0)">
+                  <span id="native_icon">&#10052;</span>
+                  <span id="native_text">Native K8s Reschedule</span>
                 </button>
               </div>
             </div>
@@ -440,35 +457,53 @@ spec:
           <div id="toast"></div>
 
           <script>
-            let lastTs = performance.now(), maxGap = 0, isMigrating = false, curActiveNode = "";
+            let lastTs = performance.now(), maxGap = 0, isMigrating = false, curActiveNode = "", activeMode = "criu";
 
-            function showToast(msg) {
+            function showToast(msg, isWarn) {
               const t = document.getElementById('toast');
               t.innerText = msg;
+              t.style.borderColor = isWarn ? '#ef4444' : 'var(--cyan)';
               t.style.display = 'block';
-              setTimeout(() => { t.style.display = 'none'; }, 4000);
+              setTimeout(() => { t.style.display = 'none'; }, 5000);
             }
 
-            async function triggerMigration() {
-              const btn = document.getElementById('btn_migrate');
-              const txt = document.getElementById('btn_text');
-              const icon = document.getElementById('btn_icon');
-              btn.disabled = true;
+            async function triggerCriuMigration() {
+              const btnCriu = document.getElementById('btn_criu');
+              const btnNative = document.getElementById('btn_native');
+              btnCriu.disabled = true;
+              btnNative.disabled = true;
               isMigrating = true;
-              txt.innerText = 'Migrating in progress...';
-              icon.innerText = '⏳';
+              activeMode = 'criu';
+              document.getElementById('criu_text').innerText = 'Migrating via CRIU...';
+              document.getElementById('criu_icon').innerText = '⏳';
               for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.add('active');
 
               try {
                 const resp = await fetch('/live/migrate', { method: 'POST' });
                 const data = await resp.json();
-                if (data.status === 'ok') {
-                  showToast('Live migration pipeline dispatched: ' + data.source + ' ➔ ' + data.target);
-                } else {
-                  showToast('Migration trigger: ' + (data.message || data.error || 'Dispatched'));
-                }
+                showToast('⚡ CRIU pipeline dispatched: ' + data.source + ' ➔ ' + data.target, false);
               } catch (err) {
-                showToast('Trigger sent: pipeline executing...');
+                showToast('CRIU trigger sent: pipeline executing...', false);
+              }
+            }
+
+            async function triggerNativeReschedule() {
+              const btnCriu = document.getElementById('btn_criu');
+              const btnNative = document.getElementById('btn_native');
+              btnCriu.disabled = true;
+              btnNative.disabled = true;
+              isMigrating = true;
+              activeMode = 'native';
+              document.getElementById('native_text').innerText = 'Evicting pod...';
+              document.getElementById('native_icon').innerText = '⏳';
+              for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.remove('active');
+
+              try {
+                const resp = await fetch('/live/reschedule', { method: 'POST' });
+                const data = await resp.json();
+                showToast('❄️ Native eviction dispatched: ' + data.source + ' ➔ ' + data.target, true);
+              } catch (err) {
+                showToast('Native eviction sent: restarting container...', true);
               }
             }
 
@@ -493,26 +528,35 @@ spec:
 
                 if (curActiveNode && curActiveNode !== d.node && isMigrating) {
                   isMigrating = false;
-                  const btn = document.getElementById('btn_migrate');
-                  btn.disabled = false;
-                  document.getElementById('btn_text').innerText = 'Trigger Live Migration';
-                  document.getElementById('btn_icon').innerText = '⚡';
-                  showToast('✓ Successfully migrated to ' + d.node + '! State preserved.');
+                  document.getElementById('btn_criu').disabled = false;
+                  document.getElementById('btn_native').disabled = false;
+                  document.getElementById('criu_text').innerText = 'Stateful Migration (CRIU)';
+                  document.getElementById('criu_icon').innerText = '⚡';
+                  document.getElementById('native_text').innerText = 'Native K8s Reschedule';
+                  document.getElementById('native_icon').innerText = '❄️';
+                  if (activeMode === 'native') {
+                    showToast('⚠️ Native Reschedule Complete: Memory wiped to 0 (100% data loss)!', true);
+                  } else {
+                    showToast('✓ CRIU Stateful Migration Complete: Memory preserved across nodes!', false);
+                  }
                 }
                 curActiveNode = d.node;
 
                 if (d.migrations && d.migrations.length > 0) {
-                  document.getElementById('plm_body').innerHTML = d.migrations.map(m => `
+                  document.getElementById('plm_body').innerHTML = d.migrations.map(m => {
+                    const isCold = m.reason && m.reason.includes('Native');
+                    const badgeClass = isCold ? 'badge-red' : 'badge-success';
+                    return `
                     <tr>
-                      <td style="color:var(--cyan);font-weight:600;">${m.name}</td>
+                      <td style="color:${isCold ? '#ef4444' : 'var(--cyan)'};font-weight:600;">${m.name}</td>
                       <td>${m.source} &rarr; ${m.target}</td>
                       <td><span style="color:#94a3b8;">${m.reason}</span></td>
-                      <td><span class="badge-success">${m.phase}</span></td>
+                      <td><span class="${badgeClass}">${m.phase}</span></td>
                       <td style="font-weight:700;">${m.duration}</td>
                       <td style="color:#f59e0b;font-weight:700;">${m.blackout}</td>
-                      <td style="font-size:11px;color:#cbd5e1;">${m.breakdown}</td>
+                      <td style="font-size:11px;color:${isCold ? '#fca5a5' : '#cbd5e1'};">${m.breakdown}</td>
                     </tr>
-                  `).join('');
+                  `}).join('');
                 }
               } catch (e) {
                 // Network disconnect during migration cutover
@@ -548,15 +592,16 @@ spec:
                       self.wfile.write(HTML.encode("utf-8"))
 
               def do_POST(self):
-                  if self.path.startswith("/live/migrate"):
+                  if self.path.startswith("/live/migrate") or self.path.startswith("/live/reschedule"):
+                      endpoint = "trigger" if self.path.startswith("/live/migrate") else "reschedule"
                       try:
                           req = urllib.request.Request(
-                              "http://migration-trigger-api.boutique.svc.cluster.local:8080/trigger",
+                              f"http://migration-trigger-api.boutique.svc.cluster.local:8080/{endpoint}",
                               data=b"{}",
                               headers={"Content-Type": "application/json"},
                               method="POST",
                           )
-                          with urllib.request.urlopen(req, timeout=5) as resp:
+                          with urllib.request.urlopen(req, timeout=30) as resp:
                               res_data = resp.read()
                               self.send_response(200)
                               self.send_header("Content-Type", "application/json")

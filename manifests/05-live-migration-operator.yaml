@@ -543,7 +543,96 @@ spec:
                                   }
                               }
                               k8s("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations", method="POST", body=plm)
-                              resp = {"status": "ok", "plm": plm_name, "source": cur, "target": target}
+                              resp = {"status": "ok", "mode": "criu", "plm": plm_name, "source": cur, "target": target}
+                              self.send_response(200)
+                              self.send_header("Content-Type", "application/json")
+                              self.send_header("Access-Control-Allow-Origin", "*")
+                              self.end_headers()
+                              self.wfile.write(json.dumps(resp).encode("utf-8"))
+                          except Exception as e:
+                              self.send_response(500)
+                              self.send_header("Content-Type", "application/json")
+                              self.send_header("Access-Control-Allow-Origin", "*")
+                              self.end_headers()
+                              self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+
+                      elif self.path in ("/reschedule", "/live/reschedule"):
+                          try:
+                              pod = k8s("/api/v1/namespaces/boutique/pods/live-stream-pod")
+                              cur = pod.get("spec", {}).get("nodeName", "k8s-worker-1")
+                              target = "k8s-worker-2" if cur == "k8s-worker-1" else "k8s-worker-1"
+
+                              before_val = 0
+                              try:
+                                  with urllib.request.urlopen("http://live-stream-service.boutique.svc.cluster.local:8090/live/state", timeout=1) as r:
+                                      before_val = json.loads(r.read().decode("utf-8")).get("ram_counter", 0)
+                              except Exception: pass
+
+                              t0 = time.monotonic()
+                              # Force delete without CRIU
+                              k8s("/api/v1/namespaces/boutique/pods/live-stream-pod?gracePeriodSeconds=0", method="DELETE")
+
+                              dl = time.monotonic() + 30
+                              while time.monotonic() < dl:
+                                  try:
+                                      k8s("/api/v1/namespaces/boutique/pods/live-stream-pod")
+                                      time.sleep(0.1)
+                                  except Exception:
+                                      break
+
+                              # Recreate clean pod on target node
+                              spec = pod["spec"]
+                              spec["nodeName"] = target
+                              new_pod = {
+                                  "apiVersion": "v1",
+                                  "kind": "Pod",
+                                  "metadata": {"name": "live-stream-pod", "namespace": "boutique", "labels": {"app": "live-stream"}},
+                                  "spec": spec
+                              }
+                              k8s("/api/v1/namespaces/boutique/pods", method="POST", body=new_pod)
+
+                              after_val = 0
+                              dl2 = time.monotonic() + 60
+                              while time.monotonic() < dl2:
+                                  try:
+                                      with urllib.request.urlopen("http://live-stream-service.boutique.svc.cluster.local:8090/live/state", timeout=0.3) as r:
+                                          if r.status == 200:
+                                              after_val = json.loads(r.read().decode("utf-8")).get("ram_counter", 0)
+                                              break
+                                  except Exception: pass
+                                  time.sleep(0.1)
+
+                              t_elapsed = int((time.monotonic() - t0) * 1000)
+
+                              rec = {
+                                  "name": f"native-k8s-{int(time.time())}",
+                                  "source": cur,
+                                  "target": target,
+                                  "reason": "NativeK8sEviction",
+                                  "phase": "Cold Restart (State Lost)",
+                                  "duration": f"{t_elapsed}ms",
+                                  "blackout": f"{t_elapsed}ms",
+                                  "breakdown": f"No CRIU checkpoint | 100% RAM State Lost ({before_val} -> {after_val})",
+                              }
+                              try:
+                                  req_rec = urllib.request.Request(
+                                      "http://live-stream-service.boutique.svc.cluster.local:8090/live/record",
+                                      data=json.dumps(rec).encode("utf-8"),
+                                      headers={"Content-Type": "application/json"},
+                                      method="POST"
+                                  )
+                                  urllib.request.urlopen(req_rec, timeout=2)
+                              except Exception: pass
+
+                              resp = {
+                                  "status": "ok",
+                                  "mode": "cold_reschedule",
+                                  "source": cur,
+                                  "target": target,
+                                  "duration": t_elapsed,
+                                  "counter_before": before_val,
+                                  "counter_after": after_val,
+                              }
                               self.send_response(200)
                               self.send_header("Content-Type", "application/json")
                               self.send_header("Access-Control-Allow-Origin", "*")
