@@ -1,0 +1,669 @@
+# ==============================================================================
+# STATEFUL POD LIVE MIGRATION OPERATOR (CRI-O + CRIU + Buildah + Registry)
+# ------------------------------------------------------------------------------
+# Research prototype. NOTE: KEP-2008 (Forensic Container Checkpointing) specifies ONLY
+# the kubelet Checkpoint API for forensic analysis; container live migration is explicitly a Non-Goal.
+# The pipeline below is a custom implementation built on top of the KEP-2008 API and CRI-O's
+# OCI checkpoint image restoration mechanism (annotation io.kubernetes.cri-o.annotations.checkpoint.name,
+# see CRI-O server/container_restore.go).
+# Automated node triggers (cordon, spot-interruption, consolidate-node labels) are custom architectural
+# additions of this project.
+#
+# 1. Internal OCI Checkpoint Registry (10.10.1.10:5000) on the control-plane node;
+# 2. Automated node hazard detection (NodeMaintenance, SpotInstancePreemption, ClusterConsolidation);
+# 3. End-to-end 4-stage pipeline on the source worker node (DaemonSet + nsenter):
+#    - T_dump:     POST /checkpoint/boutique/live-stream-pod/stream-server
+#    - T_build:    buildah from scratch + add tar + io.kubernetes.cri-o.annotations.checkpoint.name=stream-server
+#    - T_transfer: buildah push --tls-verify=false 10.10.1.10:5000/stream-server-checkpoint:<PLM-name>
+#    - T_restore:  Bind restored pod via spec.nodeName to the target worker node
+#                  and wait for a verified HTTP 200 response from the restored process.
+# ==============================================================================
+
+# 0. Local OCI Registry on the control-plane node (10.10.1.10:5000) for checkpoint image transfer
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkpoint-registry
+  namespace: boutique
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checkpoint-registry
+  template:
+    metadata:
+      labels:
+        app: checkpoint-registry
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: k8s-master
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: registry
+          image: docker.io/library/registry:2
+          ports:
+            - containerPort: 5000
+---
+# 1. Register CustomResourceDefinition `kind: PodLiveMigration` (shortName: plm)
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: podlivemigrations.migration.research.io
+spec:
+  group: migration.research.io
+  names:
+    kind: PodLiveMigration
+    listKind: PodLiveMigrationList
+    plural: podlivemigrations
+    singular: podlivemigration
+    shortNames:
+      - plm
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Pod
+          type: string
+          jsonPath: .spec.podName
+        - name: Source
+          type: string
+          jsonPath: .spec.sourceNode
+        - name: Target
+          type: string
+          jsonPath: .spec.targetNode
+        - name: TriggerReason
+          type: string
+          jsonPath: .spec.triggerReason
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: TotalDuration
+          type: string
+          jsonPath: .status.totalDuration
+        - name: HTTPBlackout
+          type: string
+          jsonPath: .status.httpBlackout
+        - name: Breakdown
+          type: string
+          jsonPath: .status.breakdown
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["podName", "sourceNode", "targetNode"]
+              properties:
+                podName:
+                  type: string
+                sourceNode:
+                  type: string
+                targetNode:
+                  type: string
+                triggerReason:
+                  type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                totalDuration:
+                  type: string
+                httpBlackout:
+                  type: string
+                breakdown:
+                  type: string
+                message:
+                  type: string
+---
+# 2. RBAC Permissions (ServiceAccount + ClusterRoleBinding cluster-admin for invoking kubelet checkpoint API :10250)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: live-migration-operator-sa
+  namespace: boutique
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: live-migration-operator-admin
+subjects:
+  - kind: ServiceAccount
+    name: live-migration-operator-sa
+    namespace: boutique
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+# 3. Autonomous Operator Controller Code (DaemonSet on workers with access to Buildah and /var/lib/kubelet/checkpoints)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: live-migration-operator-code
+  namespace: boutique
+data:
+  controller.py: |
+    import json
+    import os
+    import socket
+    import ssl
+    import subprocess
+    import time
+    import urllib.request
+
+    # A pod with hostNetwork uses the node's host DNS, so we read the API server ClusterIP
+    # directly from the environment variables injected by kubelet into every pod.
+    APISERVER = f"https://{os.environ.get('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc')}:{os.environ.get('KUBERNETES_SERVICE_PORT', '443')}"
+    TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    MY_NODE = os.environ.get("NODE_NAME", socket.gethostname())
+    CHECKPOINT_REPO = "10.10.1.10:5000/stream-server-checkpoint"
+
+    def get_token():
+        with open(TOKEN_PATH, "r") as f:
+            return f.read().strip()
+
+    SSL_CTX = ssl.create_default_context(cafile=CA_PATH)
+
+    def k8s_request(path, method="GET", body=None, content_type="application/json"):
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": content_type}
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(f"{APISERVER}{path}", data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def host_cmd(cmd_str, timeout=300):
+        """Executes a command inside the node's root namespace (nsenter into PID 1) to access /var/lib/kubelet/checkpoints and buildah."""
+        r = subprocess.run(
+            ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "bash", "-c", cmd_str],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"host command failed (rc={r.returncode}): {(r.stderr or r.stdout).strip()[-400:]}")
+        return r
+
+    def probe_pod_counter(pod_ip, timeout=0.5):
+        if not pod_ip:
+            return None
+        try:
+            with urllib.request.urlopen(f"http://{pod_ip}:8090/live/state", timeout=timeout) as r:
+                if r.status == 200:
+                    return json.loads(r.read().decode("utf-8")).get("ram_counter")
+        except Exception:
+            return None
+        return None
+
+    def notify_restored_pod(pod_ip, payload):
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://{pod_ip}:8090/live/record",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=2) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def detect_node_hazard(node):
+        spec = node.get("spec", {})
+        labels = node.get("metadata", {}).get("labels", {})
+        if spec.get("unschedulable") is True:
+            return "NodeMaintenance"
+        if labels.get("spot-interruption") == "true":
+            return "SpotInstancePreemption"
+        if labels.get("consolidate-node") == "true":
+            return "ClusterConsolidation"
+        return None
+
+    def auto_watch_cluster():
+        nodes = k8s_request("/api/v1/nodes").get("items", [])
+        healthy_workers = []
+        hazard_nodes = {}
+
+        for n in nodes:
+            name = n["metadata"]["name"]
+            if "master" in name or "control-plane" in n["metadata"].get("labels", {}):
+                continue
+            reason = detect_node_hazard(n)
+            if reason:
+                hazard_nodes[name] = reason
+            else:
+                healthy_workers.append(name)
+
+        if MY_NODE not in hazard_nodes or not healthy_workers:
+            return
+
+        pods = k8s_request("/api/v1/namespaces/boutique/pods").get("items", [])
+        existing_plms = k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations").get("items", [])
+        # Do not create a duplicate migration if a PLM for this pod on this source node already exists
+        # in any non-Succeeded state (Pending/Migrating/Failed). To retry after Failed: kubectl delete plm <name> -n boutique
+        active_pods = {
+            p["spec"]["podName"] for p in existing_plms
+            if p.get("status", {}).get("phase") != "Succeeded" and p["spec"].get("sourceNode") == MY_NODE
+        }
+
+        for pod in pods:
+            pod_name = pod["metadata"]["name"]
+            node_name = pod["spec"].get("nodeName")
+            if pod_name == "live-stream-pod" and node_name == MY_NODE and pod_name not in active_pods:
+                target_node = healthy_workers[0]
+                reason = hazard_nodes[MY_NODE]
+                plm_name = f"migrate-{pod_name}-{int(time.time())}"
+                body = {
+                    "apiVersion": "migration.research.io/v1alpha1",
+                    "kind": "PodLiveMigration",
+                    "metadata": {"name": plm_name, "namespace": "boutique"},
+                    "spec": {
+                        "podName": pod_name,
+                        "sourceNode": MY_NODE,
+                        "targetNode": target_node,
+                        "triggerReason": reason,
+                    },
+                }
+                k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations", method="POST", body=body)
+
+    def update_status(ns, name, phase, total_duration="-", breakdown="-", msg="", http_blackout="-"):
+        patch = {"status": {
+            "phase": phase, "totalDuration": total_duration, "httpBlackout": http_blackout,
+            "breakdown": breakdown, "message": msg,
+        }}
+        k8s_request(
+            f"/apis/migration.research.io/v1alpha1/namespaces/{ns}/podlivemigrations/{name}/status",
+            method="PATCH", body=patch, content_type="application/merge-patch+json"
+        )
+
+    def execute_migration_pipeline(ns, plm_name, pod_name, src_node, dst_node, reason):
+        update_status(ns, plm_name, "Migrating", "-", "Step 1/4: Kubelet CRIU Checkpoint", f"[{reason}] Starting CRI-O checkpoint")
+        token = get_token()
+        ckpt_image = f"{CHECKPOINT_REPO}:{plm_name}"
+
+        src_pod = k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}")
+        src_pod_ip = src_pod.get("status", {}).get("podIP")
+        counter_at_dump = probe_pod_counter(src_pod_ip)
+
+        # STEP 1: Kubelet Checkpoint API (:10250/checkpoint authenticated via cluster-admin Bearer token).
+        # CRI-O 1.31 (server/container_checkpoint.go) invokes checkpointing with KeepRunning=true, so the source
+        # container continues running and serving traffic until pod deletion in Step 4.
+        t0 = time.monotonic()
+        host_cmd(f"rm -f /var/lib/kubelet/checkpoints/checkpoint-{pod_name}_{ns}-stream-server-*.tar")
+        host_cmd(f"curl -sS -f -m 120 -k -X POST -H 'Authorization: Bearer {token}' https://localhost:10250/checkpoint/{ns}/{pod_name}/stream-server")
+        t1 = time.monotonic()
+        dump_ms = int((t1 - t0) * 1000)
+
+        # STEP 2: Package the checkpoint archive into an OCI image via Buildah with the CRI-O checkpoint annotation
+        # (official procedure: kubernetes.io -> Forensic container checkpointing -> Restore a checkpointed container)
+        update_status(ns, plm_name, "Migrating", "-", f"Dump={dump_ms}ms | Step 2/4: Buildah OCI", "Packaging CRIU tar into OCI image")
+        build_script = f"""
+        set -e
+        TAR_FILE=$(ls -t /var/lib/kubelet/checkpoints/checkpoint-{pod_name}_{ns}-stream-server-*.tar | head -n 1)
+        CID=$(buildah from scratch)
+        buildah add "$CID" "$TAR_FILE" /
+        buildah config --annotation=io.kubernetes.cri-o.annotations.checkpoint.name=stream-server "$CID"
+        buildah commit "$CID" {ckpt_image}
+        buildah rm "$CID"
+        rm -f "$TAR_FILE"
+        """
+        host_cmd(build_script)
+        t2 = time.monotonic()
+        build_ms = int((t2 - t1) * 1000)
+
+        # STEP 3: Push the OCI checkpoint image to the internal cluster HTTP registry (tls-verify=false)
+        update_status(ns, plm_name, "Migrating", "-", f"Dump={dump_ms}ms, Build={build_ms}ms | Step 3/4: Push", "Pushing OCI checkpoint image")
+        host_cmd(f"buildah push --tls-verify=false {ckpt_image}")
+        host_cmd(f"buildah rmi {ckpt_image} || true")
+        t3 = time.monotonic()
+        push_ms = int((t3 - t2) * 1000)
+
+        # Sample the in-memory counter on the source node immediately prior to pod deletion.
+        # While Build + Push were running, the source container kept running (KeepRunning=true);
+        # state increments occurring after the dump snapshot are not part of the checkpoint image.
+        counter_at_kill = probe_pod_counter(src_pod_ip)
+        t_kill = time.monotonic()
+
+        # STEP 4: Delete the old pod on src_node and create the restored pod on dst_node via spec.nodeName.
+        # From this moment until the first HTTP 200 from the restored process, the service is in its HTTP blackout window.
+        update_status(ns, plm_name, "Migrating", "-", f"Dump={dump_ms}ms, Build={build_ms}ms, Push={push_ms}ms | Step 4/4: Restore", f"Restoring on {dst_node}")
+        k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}?gracePeriodSeconds=0", method="DELETE")
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}")
+            except Exception:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"old pod {pod_name} was not deleted within 60s")
+            time.sleep(0.1)
+
+        # The bind-mount set of the restored pod must match the source pod (validated by CRI-O in
+        # CRImportCheckpoint), so the pod specification mirrors the source: no ServiceAccount token mount, identical ports.
+        restored_pod = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": ns, "labels": {"app": "live-stream"}},
+            "spec": {
+                "automountServiceAccountToken": False,
+                "nodeName": dst_node,
+                "tolerations": [{"operator": "Exists"}],
+                "containers": [{
+                    "name": "stream-server",
+                    "image": ckpt_image,
+                    "imagePullPolicy": "Always",
+                    "ports": [{"containerPort": 8090}],
+                }],
+            },
+        }
+        k8s_request(f"/api/v1/namespaces/{ns}/pods", method="POST", body=restored_pod)
+
+        # Wait not merely for Pod phase=Running, but for an actual HTTP 200 response from the restored process on dst_node!
+        dst_pod_ip = None
+        counter_at_restore = None
+        last_state = "unknown"
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            p = k8s_request(f"/api/v1/namespaces/{ns}/pods/{pod_name}")
+            cs = (p.get("status", {}).get("containerStatuses") or [{}])[0]
+            waiting = cs.get("state", {}).get("waiting")
+            if waiting:
+                last_state = f"{waiting.get('reason')}: {waiting.get('message', '')}"[:300]
+            if p.get("status", {}).get("phase") == "Running":
+                dst_pod_ip = p.get("status", {}).get("podIP")
+                c_val = probe_pod_counter(dst_pod_ip, timeout=0.2)
+                if c_val is not None:
+                    counter_at_restore = c_val
+                    break
+            time.sleep(0.05)
+
+        if counter_at_restore is None:
+            raise RuntimeError(f"restore on {dst_node} did not return HTTP 200 within 120s; container state: {last_state}")
+
+        t4 = time.monotonic()
+        restore_ms = int((t4 - t3) * 1000)
+        http_blackout_ms = int((t4 - t_kill) * 1000)
+        total_ms = int((t4 - t0) * 1000)
+        breakdown = (
+            f"Dump:{dump_ms}ms | Build:{build_ms}ms | Push:{push_ms}ms | Restore:{restore_ms}ms "
+            f"| HTTP_Blackout:{http_blackout_ms}ms | Counter({counter_at_dump}->{counter_at_kill}->{counter_at_restore})"
+        )
+
+        notify_restored_pod(dst_pod_ip, {
+            "name": plm_name,
+            "source": src_node,
+            "target": dst_node,
+            "reason": reason,
+            "phase": "Succeeded",
+            "duration": f"{total_ms}ms",
+            "blackout": f"{http_blackout_ms}ms",
+            "breakdown": breakdown,
+        })
+
+        update_status(
+            ns, plm_name, "Succeeded", f"{total_ms}ms", breakdown,
+            f"Restored via CRI-O on {dst_node} (counter: dump={counter_at_dump}, kill={counter_at_kill}, restore={counter_at_restore})",
+            http_blackout=f"{http_blackout_ms}ms",
+        )
+
+    def reconcile():
+        while True:
+            try:
+                auto_watch_cluster()
+                res = k8s_request("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations")
+                for item in res.get("items", []):
+                    name = item["metadata"]["name"]
+                    ns = item["metadata"]["namespace"]
+                    status = item.get("status", {})
+                    if status.get("phase") in ("Succeeded", "Failed", "Migrating"):
+                        continue
+                    spec = item["spec"]
+                    if spec["sourceNode"] != MY_NODE:
+                        continue
+                    try:
+                        execute_migration_pipeline(
+                            ns, name, spec["podName"], spec["sourceNode"], spec["targetNode"], spec.get("triggerReason", "Manual")
+                        )
+                    except Exception as pipe_err:
+                        update_status(ns, name, "Failed", "-", "-", f"Pipeline error: {pipe_err}"[:500])
+            except Exception as e:
+                print(f"Operator loop error: {e}", flush=True)
+            time.sleep(1)
+
+    if __name__ == "__main__":
+        reconcile()
+---
+# 4. Operator DaemonSet across worker nodes
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: live-migration-operator
+  namespace: boutique
+spec:
+  selector:
+    matchLabels:
+      app: live-migration-operator
+  template:
+    metadata:
+      labels:
+        app: live-migration-operator
+    spec:
+      serviceAccountName: live-migration-operator-sa
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: operator
+          image: docker.io/library/python:3.12-slim
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command: ["python3", "/operator/controller.py"]
+          volumeMounts:
+            - name: operator-code
+              mountPath: /operator
+      volumes:
+        - name: operator-code
+          configMap:
+            name: live-migration-operator-code
+---
+# 5. Lightweight Trigger API Gateway for interactive Web UI migration actions
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: migration-trigger-api
+  namespace: boutique
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: migration-trigger-api
+  template:
+    metadata:
+      labels:
+        app: migration-trigger-api
+    spec:
+      serviceAccountName: live-migration-operator-sa
+      nodeSelector:
+        kubernetes.io/hostname: k8s-master
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: trigger-server
+          image: docker.io/library/python:3.12-slim
+          command:
+            - python3
+            - -c
+            - |
+              import http.server, json, os, ssl, time, urllib.request
+
+              APISERVER = f"https://{os.environ.get('KUBERNETES_SERVICE_HOST','10.96.0.1')}:{os.environ.get('KUBERNETES_SERVICE_PORT','443')}"
+              TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+              CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              SSL_CTX = ssl.create_default_context(cafile=CA_PATH)
+
+              def k8s(path, method="GET", body=None):
+                  with open(TOKEN_PATH) as f:
+                      token = f.read().strip()
+                  headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                  data = json.dumps(body).encode("utf-8") if body else None
+                  req = urllib.request.Request(f"{APISERVER}{path}", data=data, headers=headers, method=method)
+                  with urllib.request.urlopen(req, context=SSL_CTX, timeout=10) as r:
+                      return json.loads(r.read().decode("utf-8"))
+
+              class H(http.server.BaseHTTPRequestHandler):
+                  def log_message(self, *a): pass
+                  def do_POST(self):
+                      if self.path in ("/trigger", "/live/migrate"):
+                          try:
+                              pod = k8s("/api/v1/namespaces/boutique/pods/live-stream-pod")
+                              cur = pod.get("spec", {}).get("nodeName", "k8s-worker-1")
+                              target = "k8s-worker-2" if cur == "k8s-worker-1" else "k8s-worker-1"
+                              plm_name = f"web-run-{int(time.time())}"
+                              plm = {
+                                  "apiVersion": "migration.research.io/v1alpha1",
+                                  "kind": "PodLiveMigration",
+                                  "metadata": {"name": plm_name, "namespace": "boutique"},
+                                  "spec": {
+                                      "podName": "live-stream-pod",
+                                      "sourceNode": cur,
+                                      "targetNode": target,
+                                      "triggerReason": "InteractiveWebUI",
+                                  }
+                              }
+                              k8s("/apis/migration.research.io/v1alpha1/namespaces/boutique/podlivemigrations", method="POST", body=plm)
+                              resp = {"status": "ok", "mode": "criu", "plm": plm_name, "source": cur, "target": target}
+                              self.send_response(200)
+                              self.send_header("Content-Type", "application/json")
+                              self.send_header("Access-Control-Allow-Origin", "*")
+                              self.end_headers()
+                              self.wfile.write(json.dumps(resp).encode("utf-8"))
+                          except Exception as e:
+                              self.send_response(500)
+                              self.send_header("Content-Type", "application/json")
+                              self.send_header("Access-Control-Allow-Origin", "*")
+                              self.end_headers()
+                              self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+
+                      elif self.path in ("/reschedule", "/live/reschedule"):
+                          try:
+                              pod = k8s("/api/v1/namespaces/boutique/pods/live-stream-pod")
+                              cur = pod.get("spec", {}).get("nodeName", "k8s-worker-1")
+                              target = "k8s-worker-2" if cur == "k8s-worker-1" else "k8s-worker-1"
+
+                              before_val = 0
+                              try:
+                                  with urllib.request.urlopen("http://live-stream-service.boutique.svc.cluster.local:8090/live/state", timeout=1) as r:
+                                      before_val = json.loads(r.read().decode("utf-8")).get("ram_counter", 0)
+                              except Exception: pass
+
+                              t0 = time.monotonic()
+                              # Force delete without CRIU
+                              k8s("/api/v1/namespaces/boutique/pods/live-stream-pod?gracePeriodSeconds=0", method="DELETE")
+
+                              dl = time.monotonic() + 30
+                              while time.monotonic() < dl:
+                                  try:
+                                      k8s("/api/v1/namespaces/boutique/pods/live-stream-pod")
+                                      time.sleep(0.1)
+                                  except Exception:
+                                      break
+
+                              # Recreate clean pod on target node from clean template (no CRIU checkpoint)
+                              cm = k8s("/api/v1/namespaces/boutique/configmaps/live-stream-template")
+                              new_pod = json.loads(cm["data"]["pod.json"])
+                              new_pod["metadata"]["name"] = "live-stream-pod"
+                              new_pod["metadata"]["namespace"] = "boutique"
+                              new_pod["spec"]["nodeName"] = target
+                              k8s("/api/v1/namespaces/boutique/pods", method="POST", body=new_pod)
+
+                              after_val = 0
+                              dl2 = time.monotonic() + 60
+                              while time.monotonic() < dl2:
+                                  try:
+                                      with urllib.request.urlopen("http://live-stream-service.boutique.svc.cluster.local:8090/live/state", timeout=0.3) as r:
+                                          if r.status == 200:
+                                              after_val = json.loads(r.read().decode("utf-8")).get("ram_counter", 0)
+                                              break
+                                  except Exception: pass
+                                  time.sleep(0.1)
+
+                              t_elapsed = int((time.monotonic() - t0) * 1000)
+
+                              rec = {
+                                  "name": f"native-k8s-{int(time.time())}",
+                                  "source": cur,
+                                  "target": target,
+                                  "reason": "NativeK8sEviction",
+                                  "phase": "Cold Restart (State Lost)",
+                                  "duration": f"{t_elapsed}ms",
+                                  "blackout": f"{t_elapsed}ms",
+                                  "breakdown": f"No CRIU checkpoint | 100% RAM State Lost ({before_val} -> {after_val})",
+                              }
+                              try:
+                                  req_rec = urllib.request.Request(
+                                      "http://live-stream-service.boutique.svc.cluster.local:8090/live/record",
+                                      data=json.dumps(rec).encode("utf-8"),
+                                      headers={"Content-Type": "application/json"},
+                                      method="POST"
+                                  )
+                                  urllib.request.urlopen(req_rec, timeout=2)
+                              except Exception: pass
+
+                              resp = {
+                                  "status": "ok",
+                                  "mode": "cold_reschedule",
+                                  "source": cur,
+                                  "target": target,
+                                  "duration": t_elapsed,
+                                  "counter_before": before_val,
+                                  "counter_after": after_val,
+                              }
+                              self.send_response(200)
+                              self.send_header("Content-Type", "application/json")
+                              self.send_header("Access-Control-Allow-Origin", "*")
+                              self.end_headers()
+                              self.wfile.write(json.dumps(resp).encode("utf-8"))
+                          except Exception as e:
+                              self.send_response(500)
+                              self.send_header("Content-Type", "application/json")
+                              self.send_header("Access-Control-Allow-Origin", "*")
+                              self.end_headers()
+                              self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+
+                  def do_OPTIONS(self):
+                      self.send_response(200)
+                      self.send_header("Access-Control-Allow-Origin", "*")
+                      self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                      self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                      self.end_headers()
+
+              server = http.server.HTTPServer(("0.0.0.0", 8080), H)
+              print("Trigger API listening on :8080", flush=True)
+              server.serve_forever()
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: migration-trigger-api
+  namespace: boutique
+spec:
+  selector:
+    app: migration-trigger-api
+  ports:
+    - port: 8080
+      targetPort: 8080
