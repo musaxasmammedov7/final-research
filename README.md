@@ -12,20 +12,20 @@ Measurements were collected using `scripts/benchmark_migration.py` on a live AWS
 
 ### 1. Stage-by-Stage Migration Pipeline Breakdown (CRI-O + CRIU + Buildah)
 
-| Pipeline Stage | Mechanism | Median (p50) | 95th Percentile (p95) | Time Share |
+| Pipeline Stage | Mechanism | Run 1 (`worker-1` $\to$ `worker-2`) | Run 2 (`worker-2` $\to$ `worker-1`) | Empirical Average |
 |---|---|---|---|---|
-| **$T_{\text{dump}}$** | Kubelet Checkpoint API (`POST :10250` + CRIU dump) | **136 ms** | **144 ms** | ~7.2% |
-| **$T_{\text{build}}$** | Buildah OCI packaging (scratch + tar + CRI-O annotation) | **357 ms** | **384 ms** | ~18.9% |
-| **$T_{\text{push}}$** | OCI Registry transfer (`10.10.1.10:5000`) | **284 ms** | **326 ms** | ~15.0% |
-| **$T_{\text{restore}}$** | CRI-O container import + runc restore + first HTTP 200 | **1113 ms** | **1187 ms** | ~58.9% |
-| **Total Duration** | Full migration pipeline ($T_{\text{dump}} \dots T_{\text{restore}}$) | **1890 ms** | **2041 ms** | 100% |
+| **$T_{\text{dump}}$** | Kubelet Checkpoint API (`POST :10250` + CRIU dump) | **159 ms** | **147 ms** | **153 ms** |
+| **$T_{\text{build}}$** | Buildah OCI packaging (scratch + tar + CRI-O annotation) | **385 ms** | **388 ms** | **386.5 ms** |
+| **$T_{\text{push}}$** | OCI Registry transfer (`10.10.1.10:5000`) | **310 ms** | **308 ms** | **309 ms** |
+| **$T_{\text{restore}}$** | CRI-O container import + runc restore + first HTTP 200 | **1080 ms** | **798 ms** | **939 ms** |
+| **Total Duration** | Full migration pipeline ($T_{\text{dump}} \dots T_{\text{restore}}$) | **1935 ms** | **1642 ms** | **1788.5 ms** |
 
 ### 2. Comparison with Native Kubernetes (Baseline: Cold Reschedule)
 
 | Metric | CRI-O + CRIU Stateful Migration (Proposed) | Baseline: Native K8s Cold Reschedule |
 |---|---|---|
-| **Client Downtime (External HTTP Blackout)** | **1064 ms** (p50) / **1125 ms** (p95) | **1126 ms** (p50) / **1180 ms** (p95) |
-| **In-Memory RAM State Preservation** | **100% preserved** (`Counter: 670 -> 679 -> 676`) | **0% (reset to 0)** (`Counter: 691 -> 7`) |
+| **Client Downtime (External HTTP Blackout)** | **797 ms** (Best) / **1078 ms** | **1289 ms** |
+| **In-Memory RAM State Preservation** | **100% preserved** (`51 -> 60 -> 57` & `77 -> 85 -> 79`) | **0% (reset to 0)** (`43544 -> 8`) |
 | **Runtime Overhead During Normal Execution** | **0.000 ms** (state written directly to RAM at CPU speed) | **0.000 ms** (pure RAM) |
 | **Application Code Refactoring Required** | **None** (transparent to the application process) | **None** (but 100% of volatile state is lost) |
 
