@@ -140,13 +140,15 @@ A high-frequency external prober interrogated the cluster ingress at 50~Hz (20~m
 \centering
 \caption{Empirical Benchmark Comparison: Proposed CRIU Stateful Migration vs. Native Kubernetes Eviction}
 \label{tab:results}
+\resizebox{0.95\textwidth}{!}{%
 \begin{tabular}{@{}lcccccc@{}}
 \toprule
 \textbf{Execution Run} & \textbf{Pipeline Path} & \textbf{Total Time ($T_{\text{total}}$)} & \textbf{Dump ($T_{\text{dump}}$)} & \textbf{Build ($T_{\text{build}}$)} & \textbf{Push ($T_{\text{push}}$)} & \textbf{Blackout ($T_{\text{blackout}}$)} \\ \midrule
 \textbf{Native Eviction (Baseline)} & \texttt{worker-2} $\to$ \texttt{worker-1} & 1289~ms & N/A & N/A & N/A & \textbf{1289~ms} \\
 \textbf{CRIU Migration (Run 1)} & \texttt{worker-1} $\to$ \texttt{worker-2} & 1935~ms & 159~ms & 385~ms & 310~ms & \textbf{1078~ms} \\
 \textbf{CRIU Migration (Run 2)} & \texttt{worker-2} $\to$ \texttt{worker-1} & 1642~ms & 147~ms & 388~ms & 308~ms & \textbf{797~ms} \\ \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table*}
 
 \subsection{State Continuity \& Blackout Analysis}
