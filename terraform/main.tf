@@ -208,6 +208,17 @@ resource "aws_instance" "k8s_workers" {
   }
 }
 
+resource "aws_ec2_instance_state" "master_state" {
+  instance_id = aws_instance.k8s_master.id
+  state       = "running"
+}
+
+resource "aws_ec2_instance_state" "worker_state" {
+  count       = 2
+  instance_id = aws_instance.k8s_workers[count.index].id
+  state       = "running"
+}
+
 # 7. Автоматическая генерация inventory.ini для Ansible
 resource "local_file" "ansible_inventory" {
   content = <<-EOT

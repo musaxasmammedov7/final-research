@@ -126,6 +126,7 @@ def run_single_criu_migration(run_idx, src_node, dst_node, svc_url):
     prober.stop()
 
     ext_blackout_ms = prober.max_http_blackout_ms()
+    sh(f"kubectl delete plm {plm_name} -n boutique --ignore-not-found >/dev/null 2>&1 || true")
     m = re.search(
         r"Dump:(\d+)ms \| Build:(\d+)ms \| Push:(\d+)ms \| Restore:(\d+)ms \| HTTP_Blackout:(\d+)ms \| Counter\((\w+)->(\w+)->(\w+)\)",
         breakdown_str,
@@ -208,6 +209,7 @@ def main():
     args = parser.parse_args()
 
     svc_url = get_service_url()
+    sh("kubectl delete plm --all -n boutique >/dev/null 2>&1 || true")
     print(f"[*] High-Frequency External Prober target: {svc_url} (polling every 20 ms / 50 Hz)\n")
 
     results = []

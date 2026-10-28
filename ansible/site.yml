@@ -108,6 +108,8 @@
           tcp-close
           shell-job
           ext-unix-sk
+          skip-in-flight
+          skip-mnt /run/.containerenv
 
     - name: "1.10 Добавление официальных GPG-ключей Kubernetes v1.31 и CRI-O v1.31"
       ansible.builtin.shell: |
@@ -159,6 +161,11 @@
 
     - name: "1.13b Удаление дефолтного bridge-CNI конфига CRI-O (чтобы сетью подов управлял только Cilium)"
       ansible.builtin.shell: rm -f /etc/cni/net.d/*crio-bridge*.conflist /etc/cni/net.d/*crio-bridge*.conf
+      changed_when: false
+
+    - name: "1.13c Отключение signature_policy в CRI-O (валидация подписей не поддерживается при container restore)"
+      ansible.builtin.shell: |
+        sed -i 's/^signature_policy/#signature_policy/' /etc/crio/crio.conf.d/10-crio.conf 2>/dev/null || true
       changed_when: false
 
     - name: "1.14 Разрешение локального HTTP-реестра (10.10.1.10:5000) для пересылки OCI-образов чекпоинтов"

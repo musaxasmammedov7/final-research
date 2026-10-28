@@ -297,7 +297,7 @@ data:
         # контейнер продолжает работать и обслуживать трафик до момента удаления пода на шаге 4.
         t0 = time.monotonic()
         host_cmd(f"rm -f /var/lib/kubelet/checkpoints/checkpoint-{pod_name}_{ns}-stream-server-*.tar")
-        host_cmd(f"curl -sf -m 120 -k -X POST -H 'Authorization: Bearer {token}' https://localhost:10250/checkpoint/{ns}/{pod_name}/stream-server")
+        host_cmd(f"curl -sS -f -m 120 -k -X POST -H 'Authorization: Bearer {token}' https://localhost:10250/checkpoint/{ns}/{pod_name}/stream-server")
         t1 = time.monotonic()
         dump_ms = int((t1 - t0) * 1000)
 
