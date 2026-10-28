@@ -60,7 +60,7 @@ data:
     rgba(239, 68, 68, 0.45);\n    transform: translateY(-1px);\n  }\n  .btn-trigger:disabled
     {\n    opacity: 0.5;\n    cursor: not-allowed;\n    transform: none;\n    box-shadow:
     none;\n  }\n\n  /* Metrics Grid */\n  .grid { display: grid; grid-template-columns:
-    repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }\n  .card {\n    background:
+    repeat(3, 1fr); gap: 16px; margin-bottom: 24px; }\n  .card {\n    background:
     var(--card);\n    border: 1px solid var(--card-border);\n    border-radius: 12px;\n    padding:
     18px 20px;\n    position: relative;\n    transition: border-color 0.2s ease;\n  }\n  .card:hover
     { border-color: var(--card-hover); }\n  .card-label {\n    font-size: 11px;\n    font-family:
@@ -97,33 +97,13 @@ data:
     {\n    background: rgba(16, 185, 129, 0.12);\n    color: var(--emerald);\n    border:
     1px solid rgba(16, 185, 129, 0.3);\n    padding: 3px 8px;\n    border-radius:
     6px;\n    font-weight: 600;\n    font-size: 11px;\n  }\n  .empty-state { text-align:
-    center; color: var(--muted); padding: 24px; font-style: italic; }\n  \n  /* Benchmark
-    Comparison */\n  .bench-grid { display: grid; grid-template-columns: 1fr 1fr;
-    gap: 16px; margin-bottom: 24px; }\n  .bench-card {\n    border-radius: 12px;\n    padding:
-    20px;\n    position: relative;\n    background: var(--card);\n    border: 1px
-    solid var(--card-border);\n  }\n  .bench-ours {\n    border-color: rgba(16, 185,
-    129, 0.4);\n    background: linear-gradient(180deg, rgba(16, 185, 129, 0.06) 0%,
-    rgba(13, 18, 29, 0.9) 100%);\n    box-shadow: 0 4px 20px rgba(16, 185, 129, 0.1);\n  }\n  .bench-native
-    {\n    border-color: rgba(239, 68, 68, 0.4);\n    background: linear-gradient(180deg,
-    rgba(239, 68, 68, 0.06) 0%, rgba(13, 18, 29, 0.9) 100%);\n    box-shadow: 0 4px
-    20px rgba(239, 68, 68, 0.1);\n  }\n  .bench-badge {\n    display: inline-block;\n    font-family:
-    var(--font-mono);\n    font-size: 11px;\n    font-weight: 700;\n    padding: 4px
-    10px;\n    border-radius: 6px;\n    letter-spacing: 0.5px;\n  }\n  .badge-green
-    { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16,
-    185, 129, 0.3); }\n  .badge-red { background: rgba(239, 68, 68, 0.15); color:
-    #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }\n  .bench-metric { display:
-    flex; align-items: baseline; gap: 12px; margin: 14px 0 12px; }\n  .bench-num {
-    font-size: 38px; font-weight: 800; font-family: var(--font-mono); }\n  .val-crimson
-    { color: #ef4444; text-shadow: 0 0 20px rgba(239, 68, 68, 0.3); }\n  .bench-label
-    { font-size: 14px; font-weight: 600; color: var(--text); }\n  .bench-details {
-    list-style: none; padding: 0; margin: 0; font-size: 12px; color: var(--muted);
-    line-height: 1.8; }\n  .bench-details li strong { color: var(--text); font-weight:
-    600; }\n\n  /* Status Toast */\n  #toast {\n    position: fixed;\n    bottom:
-    24px;\n    right: 24px;\n    background: #0f172a;\n    border: 1px solid var(--cyan);\n    color:
-    #f8fafc;\n    padding: 12px 18px;\n    border-radius: 10px;\n    box-shadow: 0
-    10px 25px rgba(0,0,0,0.5);\n    font-size: 13px;\n    display: none;\n    z-index:
-    100;\n  }\n</style>\n</head>\n<body>\n<div class=\"container\">\n  <header class=\"header\">\n    <div
-    class=\"brand\">\n      <span class=\"brand-badge\">CILIUM eBPF &times; CRIU</span>\n      <div>\n        <h1
+    center; color: var(--muted); padding: 24px; font-style: italic; }\n\n  /* Status
+    Toast */\n  #toast {\n    position: fixed;\n    bottom: 24px;\n    right: 24px;\n    background:
+    #0f172a;\n    border: 1px solid var(--cyan);\n    color: #f8fafc;\n    padding:
+    12px 18px;\n    border-radius: 10px;\n    box-shadow: 0 10px 25px rgba(0,0,0,0.5);\n    font-size:
+    13px;\n    display: none;\n    z-index: 100;\n  }\n</style>\n</head>\n<body>\n<div
+    class=\"container\">\n  <header class=\"header\">\n    <div class=\"brand\">\n      <span
+    class=\"brand-badge\">CILIUM eBPF &times; CRIU</span>\n      <div>\n        <h1
     class=\"title\">Stateful Container Live Migration Console</h1>\n        <p class=\"subtitle\">Zero-downtime
     memory freeze, OCI layer streaming &amp; eBPF socket retargeting</p>\n      </div>\n    </div>\n    <div
     class=\"header-links\">\n      <a href=\"/\">Storefront Demo &rarr;</a>\n    </div>\n  </header>\n\n  <div
@@ -146,44 +126,24 @@ data:
     evaluating...</div>\n    </div>\n    <div class=\"card\">\n      <div class=\"card-label\"><span>Container
     Endpoint &amp; PID</span><span>Cilium CNI</span></div>\n      <div class=\"card-val\"
     style=\"font-size: 17px; margin-top: 6px;\" id=\"pod_ip\">...</div>\n      <div
-    class=\"card-sub\">eBPF socket load-balanced</div>\n    </div>\n    <div class=\"card\">\n      <div
-    class=\"card-label\"><span>Client HTTP Blackout</span><span>50 Hz Prober</span></div>\n      <div
-    class=\"card-val\" id=\"max_gap\">0 ms</div>\n      <div class=\"card-sub\">Real
-    client perceived downtime</div>\n    </div>\n  </div>\n\n  <div class=\"section-title\">4-Stage
-    Stateful Migration Pipeline</div>\n  <div class=\"pipeline\">\n    <div class=\"step\"
-    id=\"st1\">\n      <div class=\"step-header\"><span class=\"step-title\">1. Kernel
-    Memory Freeze</span><span class=\"step-num\">CRIU</span></div>\n      <p class=\"step-desc\">Kubelet
-    checkpoint API triggers CRIU to dump memory pages into tarball (T_dump ~136ms).</p>\n    </div>\n    <div
-    class=\"step\" id=\"st2\">\n      <div class=\"step-header\"><span class=\"step-title\">2.
-    OCI Layer Assembly</span><span class=\"step-num\">Buildah</span></div>\n      <p
-    class=\"step-desc\">Packs RAM checkpoint archive into standard OCI layer with
-    CRI-O metadata (T_build ~357ms).</p>\n    </div>\n    <div class=\"step\" id=\"st3\">\n      <div
-    class=\"step-header\"><span class=\"step-title\">3. Wire Transfer</span><span
-    class=\"step-num\">Registry</span></div>\n      <p class=\"step-desc\">Streams
+    class=\"card-sub\">eBPF socket load-balanced</div>\n    </div>\n  </div>\n\n  <div
+    class=\"section-title\">4-Stage Stateful Migration Pipeline</div>\n  <div class=\"pipeline\">\n    <div
+    class=\"step\" id=\"st1\">\n      <div class=\"step-header\"><span class=\"step-title\">1.
+    Kernel Memory Freeze</span><span class=\"step-num\">CRIU</span></div>\n      <p
+    class=\"step-desc\">Kubelet checkpoint API triggers CRIU to dump memory pages
+    into tarball (T_dump ~136ms).</p>\n    </div>\n    <div class=\"step\" id=\"st2\">\n      <div
+    class=\"step-header\"><span class=\"step-title\">2. OCI Layer Assembly</span><span
+    class=\"step-num\">Buildah</span></div>\n      <p class=\"step-desc\">Packs RAM
+    checkpoint archive into standard OCI layer with CRI-O metadata (T_build ~357ms).</p>\n    </div>\n    <div
+    class=\"step\" id=\"st3\">\n      <div class=\"step-header\"><span class=\"step-title\">3.
+    Wire Transfer</span><span class=\"step-num\">Registry</span></div>\n      <p class=\"step-desc\">Streams
     checkpoint image to local cluster registry on master node (T_push ~284ms).</p>\n    </div>\n    <div
     class=\"step\" id=\"st4\">\n      <div class=\"step-header\"><span class=\"step-title\">4.
     Rehydration &amp; eBPF</span><span class=\"step-num\">CRI-O</span></div>\n      <p
     class=\"step-desc\">CRI-O unfreezes process via runc/criu; Cilium eBPF redirects
-    traffic to new IP (T_restore ~1113ms).</p>\n    </div>\n  </div>\n\n  <div class=\"section-title\">Architectural
-    Benchmark: Stateful Migration vs Native Kubernetes</div>\n  <div class=\"bench-grid\">\n    <div
-    class=\"bench-card bench-ours\">\n      <div class=\"bench-badge badge-green\">PROPOSED:
-    CRI-O + CRIU + eBPF</div>\n      <div class=\"bench-metric\">\n        <span class=\"bench-num
-    val-emerald\">100%</span>\n        <span class=\"bench-label\">RAM State Preserved</span>\n      </div>\n      <ul
-    class=\"bench-details\">\n        <li><strong>Client HTTP Blackout:</strong> ~1,064
-    ms (P95: 1,125 ms)</li>\n        <li><strong>Volatile Memory:</strong> Preserves
-    heap, open TCP listening sockets &amp; process PID</li>\n        <li><strong>Application
-    Logic:</strong> Pure OS-level freeze &mdash; zero application code changes</li>\n        <li><strong>Reliability
-    Verdict:</strong> Verified state continuity across physical AWS nodes</li>\n      </ul>\n    </div>\n\n    <div
-    class=\"bench-card bench-native\">\n      <div class=\"bench-badge badge-red\">BASELINE:
-    NATIVE KUBERNETES RESCHEDULE</div>\n      <div class=\"bench-metric\">\n        <span
-    class=\"bench-num val-crimson\">0%</span>\n        <span class=\"bench-label\">RAM
-    State Lost (Reset to 0)</span>\n      </div>\n      <ul class=\"bench-details\">\n        <li><strong>Client
-    HTTP Blackout:</strong> ~1,126 ms (Identical or higher outage duration)</li>\n        <li><strong>Volatile
-    Memory:</strong> 100% data wiped on pod termination (Counter: 5,195 &rarr; 0)</li>\n        <li><strong>Application
-    Logic:</strong> Requires rewriting code to use external DB or disks</li>\n        <li><strong>Reliability
-    Verdict:</strong> Catastrophic state loss for real-time and in-memory sessions</li>\n      </ul>\n    </div>\n  </div>\n\n  <div
-    class=\"table-wrap\">\n    <div class=\"card-label\" style=\"margin-bottom: 14px;\">Operator
-    Audit Log (kubectl get podlivemigrations -n boutique)</div>\n    <table>\n      <thead>\n        <tr>\n          <th>Job
+    traffic to new IP (T_restore ~1113ms).</p>\n    </div>\n  </div>\n\n  <div class=\"table-wrap\">\n    <div
+    class=\"card-label\" style=\"margin-bottom: 14px;\">Operator Audit Log (kubectl
+    get podlivemigrations -n boutique)</div>\n    <table>\n      <thead>\n        <tr>\n          <th>Job
     ID</th>\n          <th>Route</th>\n          <th>Trigger</th>\n          <th>Status</th>\n          <th>Pipeline
     Duration</th>\n          <th>HTTP Blackout</th>\n          <th>Phase Breakdown
     &amp; State Continuity</th>\n        </tr>\n      </thead>\n      <tbody id=\"plm_body\">\n        <tr><td
@@ -218,8 +178,7 @@ data:
     && lastTs > 0 && maxGap < 60000) maxGap = gap;\n      lastTs = now;\n\n      document.getElementById(''counter'').innerText
     = Number(d.ram_counter).toLocaleString();\n      document.getElementById(''node'').innerText
     = d.node;\n      document.getElementById(''pod_ip'').innerText = d.pod_ip + ''
-    (PID '' + d.pid + '')'';\n      \n      if (maxGap > 0 && maxGap < 60000) {\n        document.getElementById(''max_gap'').innerText
-    = maxGap + '' ms'';\n      }\n\n      const targetNode = (d.node === ''k8s-worker-1'')
+    (PID '' + d.pid + '')'';\n\n      const targetNode = (d.node === ''k8s-worker-1'')
     ? ''k8s-worker-2'' : ''k8s-worker-1'';\n      document.getElementById(''target_hint'').innerText
     = ''Next Target: '' + targetNode;\n\n      if (curActiveNode && curActiveNode
     !== d.node && isMigrating) {\n        isMigrating = false;\n        document.getElementById(''btn_criu'').disabled
