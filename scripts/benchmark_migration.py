@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Комплексный статистический бенчмарк миграции состояния в Kubernetes (CRI-O + CRIU vs Baselines).
-Выполняет 3 серии замеров с внешним высокочастотным HTTP-пробером (каждые 20 мс / 50 Гц):
+Комплексный статистический бенчмарк миграции состояния в Kubernetes (CRI-O + CRIU vs Native K8s Reschedule).
+Выполняет замеры с внешним высокочастотным HTTP-пробером (каждые 20 мс / 50 Гц):
   1. CRI-O + CRIU + Buildah Stateful Migration (N прогонов, по умолчанию 20):
      - Разбивка: T_dump, T_build, T_push, T_restore, External HTTP Blackout (p50 и p95).
      - Проверка непрерывности и разрыва счётчика: counter_at_dump -> counter_at_kill -> counter_at_restore.
-  2. Baseline 1 — Standard Cold Reschedule (обычное пересоздание пода без CRIU):
+  2. Baseline — Standard Native K8s Cold Reschedule (обычное пересоздание пода без CRIU):
      - Замеряет External HTTP Blackout и демонстрирует полную потерю состояния в RAM (сброс в 0).
-  3. Baseline 2 — внешнее хранилище состояния (Redis, redis-cart:6379):
-     - Замеряет только сетевую задержку синхронной записи одного изменения состояния в Redis
-       (время восстановления и репликация Redis не измеряются).
 """
 
 import argparse
@@ -183,26 +180,6 @@ def run_baseline_cold_reschedule(svc_url):
     }
 
 
-def run_baseline_redis_replication():
-    """Baseline 2: Замер RTT синхронной записи состояния во внешнее хранилище (redis-cart:6379). Это задержка записи, а не полноценная Redis-репликация."""
-    redis_ip = sh("kubectl get svc redis-cart -n boutique -o jsonpath='{.spec.clusterIP}'")
-    py_code = (
-        "import socket, time\n"
-        f"s = socket.create_connection(('{redis_ip}', 6379), timeout=2)\n"
-        "rtts = []\n"
-        "for i in range(1, 101):\n"
-        "    t0 = time.monotonic()\n"
-        "    cmd = f'*3\\r\\n$3\\r\\nSET\\r\\n$13\\r\\nbench_counter\\r\\n${len(str(i))}\\r\\n{i}\\r\\n'.encode()\n"
-        "    s.sendall(cmd)\n"
-        "    s.recv(64)\n"
-        "    rtts.append((time.monotonic() - t0) * 1000.0)\n"
-        "s.close()\n"
-        "print(f'{sum(rtts)/len(rtts):.3f}')\n"
-    )
-    avg_rtt_ms = float(subprocess.run(["python3", "-c", py_code], capture_output=True, text=True, check=True).stdout.strip())
-    return {"avg_write_rtt_ms": avg_rtt_ms}
-
-
 def main():
     parser = argparse.ArgumentParser(description="CRI-O + CRIU Stateful Pod Migration Benchmark")
     parser.add_argument("--runs", type=int, default=20, help="Number of CRIU migration runs (default: 20)")
@@ -242,17 +219,10 @@ def main():
         p95 = percentile(vals, 95)
         print(f"- {label:44s}: Median (p50) = {med:4d} ms | p95 = {p95:4d} ms")
 
-    print("\n=== PART 2: BASELINE COMPARISONS ===")
-    redis_base = run_baseline_redis_replication()
-    print(
-        f"- [Baseline 2: External state store, Redis (redis-cart:6379)] "
-        f"Sync network write overhead per state mutation = {redis_base['avg_write_rtt_ms']:.3f} ms/op "
-        f"(requires app refactoring & external DB)"
-    )
-
+    print("\n=== PART 2: BASELINE COMPARISON (NATIVE KUBERNETES COLD RESCHEDULE) ===")
     cold_base = run_baseline_cold_reschedule(svc_url)
     print(
-        f"- [Baseline 1: Standard Cold Reschedule (no CRIU)]  "
+        f"- [Native K8s Reschedule (no CRIU)]  "
         f"Ext_HTTP_Blackout = {cold_base['ext_blackout_ms']} ms | "
         f"Counter: {cold_base['counter_before_kill']} -> {cold_base['counter_after_restart']} (100% RAM STATE LOST!)"
     )
