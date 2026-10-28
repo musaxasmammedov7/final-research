@@ -266,11 +266,11 @@
         --set hubble.ui.enabled=true
       when: cilium_ds.rc != 0
 
-    - name: "2.6b Обеспечение чистого eBPF ClusterIP для Cilium Ingress (удаление externalTrafficPolicy при type=ClusterIP в K8s 1.31)"
+    - name: "2.6b Настройка чистого eBPF Ingress через externalIPs (без NodePort и без iptables)"
       become: false
       ansible.builtin.command: >
         kubectl patch svc cilium-ingress -n kube-system --type='json'
-        -p='[{"op": "replace", "path": "/spec/type", "value": "ClusterIP"}, {"op": "remove", "path": "/spec/externalTrafficPolicy"}]'
+        -p='[{"op": "replace", "path": "/spec/type", "value": "ClusterIP"}, {"op": "remove", "path": "/spec/externalTrafficPolicy"}, {"op": "add", "path": "/spec/externalIPs", "value": ["{{ private_ip }}"]}]'
       changed_when: false
       failed_when: false
 
