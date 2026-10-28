@@ -245,7 +245,7 @@
       failed_when: false
       changed_when: false
 
-    - name: "2.6 Установка Cilium Service Mesh с eBPF (синхронизирован пул 10.244.0.0/16)"
+    - name: "2.6 Установка Cilium Service Mesh с pure eBPF (ClusterIP Ingress, без NodePort)"
       become: false
       ansible.builtin.command: >
         cilium install
@@ -260,18 +260,19 @@
         --set ingressController.default=true
         --set ingressController.loadbalancerMode=shared
         --set ingressController.enforceHttps=false
-        --set ingressController.service.type=NodePort
+        --set ingressController.service.type=ClusterIP
         --set hubble.enabled=true
         --set hubble.relay.enabled=true
         --set hubble.ui.enabled=true
       when: cilium_ds.rc != 0
 
-    - name: "2.6b Фиксация NodePort (30080 и 30443) для Cilium Ingress"
+    - name: "2.6b Обеспечение чистого eBPF ClusterIP для Cilium Ingress (удаление externalTrafficPolicy при type=ClusterIP в K8s 1.31)"
       become: false
       ansible.builtin.command: >
         kubectl patch svc cilium-ingress -n kube-system --type='json'
-        -p='[{"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30080}, {"op": "replace", "path": "/spec/ports/1/nodePort", "value": 30443}]'
+        -p='[{"op": "replace", "path": "/spec/type", "value": "ClusterIP"}, {"op": "remove", "path": "/spec/externalTrafficPolicy"}]'
       changed_when: false
+      failed_when: false
 
     - name: "2.7 Генерация команды присоединения (join command) для Worker-нод"
       ansible.builtin.command: kubeadm token create --print-join-command
@@ -316,35 +317,6 @@
         url: "https://www.duckdns.org/update?domains={{ duckdns_domain }}&token={{ duckdns_token }}&ip={{ master_public_ip }}"
         return_content: true
       when: duckdns_token | length > 0
-
-    - name: "4.2b Проброс портов 80 и 443 на NodePort Cilium Ingress (30080 и 30443)"
-      become: true
-      ansible.builtin.iptables:
-        table: nat
-        chain: PREROUTING
-        protocol: tcp
-        destination_port: "{{ item.src }}"
-        jump: REDIRECT
-        to_ports: "{{ item.dst }}"
-        comment: "cilium-ingress-nodeport-{{ item.src }}"
-      loop:
-        - { src: "80", dst: "30080" }
-        - { src: "443", dst: "30443" }
-
-    - name: "4.2c Проброс портов 80 и 443 для локального трафика OUTPUT (для бенчмарка и curl)"
-      become: true
-      ansible.builtin.iptables:
-        table: nat
-        chain: OUTPUT
-        protocol: tcp
-        destination_port: "{{ item.src }}"
-        destination: "127.0.0.1"
-        jump: REDIRECT
-        to_ports: "{{ item.dst }}"
-        comment: "cilium-ingress-output-{{ item.src }}"
-      loop:
-        - { src: "80", dst: "30080" }
-        - { src: "443", dst: "30443" }
 
     - name: "4.3 Установка cert-manager (Let's Encrypt SSL для Cilium Ingress)"
       ansible.builtin.command: >
@@ -392,21 +364,22 @@
       register: nodes_out
       changed_when: false
 
-    - name: "4.7b Smoke-test: Cilium Ingress NodePort на 127.0.0.1:30080"
+    - name: "4.7b Smoke-test: Cilium Ingress через eBPF ClusterIP (без iptables и NodePort)"
       ansible.builtin.shell: >
+        INGRESS_IP=$(kubectl -n kube-system get svc cilium-ingress -o jsonpath='{.spec.clusterIP}') &&
         curl -s -o /dev/null -w '%{http_code}'
         -H 'Host: {{ duckdns_domain }}.duckdns.org'
-        http://127.0.0.1:30080/live/state
+        http://${INGRESS_IP}/live/state
       register: ingress_smoke
       changed_when: false
       failed_when: false
       retries: 12
-      delay: 10
+      delay: 5
       until: ingress_smoke.stdout == "200"
 
-    - name: "4.7c Результат smoke-теста Ingress (ожидается 200; иное значение - проверить Cilium Ingress)"
+    - name: "4.7c Результат smoke-теста Ingress (ожидается 200; чистый eBPF ClusterIP)"
       ansible.builtin.debug:
-        msg: "HTTP status /live/state via Cilium Ingress NodePort :30080 = {{ ingress_smoke.stdout }}"
+        msg: "HTTP status /live/state via pure eBPF Cilium Ingress = {{ ingress_smoke.stdout }}"
 
     - name: "4.8 Статус кластера"
       ansible.builtin.debug:
