@@ -32,11 +32,11 @@ musaxasmammedov77@gmail.com}
 \maketitle
 
 \begin{abstract}
-While stateless microservices in Kubernetes achieve high availability through multi-replica deployments, rolling updates, and PodDisruptionBudgets, stateful singleton workloads---such as active session brokers, in-memory stream processors, and stateful caching nodes---cannot be trivially replicated without substantial distributed consensus overhead or intrusive application refactoring. When cluster nodes undergo maintenance or ephemeral cloud infrastructure (e.g., Amazon Web Services EC2 Spot instances) is reclaimed via a two-minute preemption notification, the standard Kubernetes scheduler executes a graceful teardown (\texttt{SIGTERM} followed by \texttt{SIGKILL}), destroying all volatile in-memory heap state.
+While stateless microservices in Kubernetes achieve high availability through multi-replica deployments, rolling updates, and PodDisruptionBudgets, stateful singleton workloads lacking built-in persistence---such as legacy scientific simulations, in-memory session aggregators, and custom stateful inference caches---cannot be trivially replicated without distributed consensus overhead or intrusive application refactoring. When cluster nodes undergo maintenance or ephemeral cloud infrastructure (e.g., Amazon Web Services EC2 Spot instances) is reclaimed via a two-minute preemption notification, the standard Kubernetes eviction lifecycle (\texttt{SIGTERM} followed by \texttt{SIGKILL}) destroys all volatile in-memory heap state.
 
-This paper designs, implements, and evaluates a snapshot-consistent live migration architecture for stateful Kubernetes workloads. The pipeline coordinates the Linux Checkpoint/Restore in Userspace subsystem (CRIU v3.16.1) via the Kubelet Checkpoint API (KEP-2008), OCI artifact packaging via Buildah, the CRI-O container runtime (v1.31), and a sidecar-free Cilium eBPF Ingress architecture. We systematically evaluate the engineering trade-off between client-observed cutover blackout (Recovery Time Objective, RTO) and snapshot state drift (Recovery Point Objective, RPO). 
+This paper designs, implements, and evaluates a snapshot-consistent live migration architecture for stateful Kubernetes workloads. The pipeline coordinates the Linux Checkpoint/Restore in Userspace subsystem (CRIU v4.3) via the Kubelet Checkpoint API (KEP-2008), OCI artifact packaging via Buildah, the CRI-O container runtime (v1.31), and a sidecar-free Cilium eBPF networking stack. We formalize and measure the trade-off between client-observed cutover blackout (Recovery Time Objective, RTO) and snapshot state drift (Recovery Point Objective, RPO).
 
-Under a continuous 50~Hz ($\pm 20$~ms) probing evaluation on AWS EC2, the decoupled migration pipeline achieves a cutover blackout window of 797--1078~ms (a 16.4\%--38.2\% reduction compared to native cold reschedule at 1289~ms). When accounting for the initial memory serialization freeze stutter ($T_{\text{freeze}} \approx 147$--$159$~ms), cumulative client-perceived disruption spans 944--1237~ms (a 4.0\%--26.8\% improvement over cold restart). We document an empirical state drift of $\approx 696$~ms ($\Delta S = 6$ uncommitted updates under a 10~Hz tick rate), analyze the risks of observable time rollback in transactional applications, evaluate memory scaling limits relative to the AWS Spot 120-second preemption deadline, and release our implementation as open-source.
+Across $N = 36$ live migrations executed between AWS EC2 worker nodes, the decoupled pipeline achieves a median cutover blackout of 1064.5~ms (minimum 797~ms, mean $1132.4 \pm 241.1$~ms, $p95 = 1532$~ms) and a median process freeze time of 144.0~ms (mean $144.2 \pm 8.4$~ms), yielding a median cumulative disruption of 1203.0~ms (minimum 944~ms) compared to 1289~ms for a cold reschedule baseline that loses 100\% of RAM state. Linear regression across all 36 runs ($r = 0.9624$) reveals that CRI-O unfreezes the restored process at $\approx 537$~ms, while the remaining blackout variance stems from Kubelet's 1~s Pod Lifecycle Event Generator (PLEG) status synchronization loop. Source-side state drift is tightly bounded to $7.5 \pm 0.6$ ticks ($\approx 669$~ms RPO at 10~Hz). Finally, we formulate a self-consistent analytical scaling model for the source-side 120-second Spot evacuation deadline and release all artifacts as open-source.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -44,220 +44,243 @@ Kubernetes, Container Live Migration, CRIU, CRI-O, Cilium eBPF, Stateful Workloa
 \end{IEEEkeywords}
 
 \section{Introduction}
-Container orchestration platforms, led by Kubernetes, rely on the premise of microservice idempotency and disposable instances \cite{burns2016borg}. In stateless deployments, node drain operations (\texttt{kubectl drain}) and instance preemptions are handled transparently: the control plane provisions replacement pods prior to terminating old replicas via rolling update strategies.
+Container orchestration platforms, led by Kubernetes, are built around microservice idempotency and disposable instances \cite{burns2016borg}. In stateless deployments, node drain operations (\texttt{kubectl drain}) and instance preemptions are handled transparently by provisioning replacement pods prior to terminating old replicas via rolling update parameters (\texttt{maxSurge}, \texttt{PodDisruptionBudget}).
 
-However, an important class of cloud-native workloads relies on long-running, in-memory volatile state:
+However, a distinct class of cloud workloads relies on long-running volatile memory state without built-in distributed checkpointing:
 \begin{enumerate}
-    \item \textbf{In-Memory Session Brokers and State Engines:} Streaming analytics engines (e.g., Apache Flink task slots), distributed game session coordinators, and caching nodes maintain gigabytes of volatile heap allocations.
-    \item \textbf{Real-Time Inference and Aggregation Pipelines:} Sensor ingest pipelines and windowed aggregators retain state in volatile memory to avoid database round-trip serialization.
+    \item \textbf{Legacy and Scientific Single-Process Runtimes:} Numerical solvers, physics simulations, and monolithic C++/Python applications that accumulate gigabytes of heap state in RAM without native write-ahead logging.
+    \item \textbf{In-Memory Session Aggregators and Caches:} Stateful middleware and warm inference caches where reconstructing in-memory data structures from cold storage incurs prohibitive warm-up latency.
 \end{enumerate}
 
-When these stateful singleton workloads run on ephemeral cloud instances---most notably Amazon Web Services (AWS) EC2 Spot instances, which offer 70--90\% cost reductions relative to On-Demand pricing but are subject to preemption with a strict 120-second notice \cite{netflix_spot, aws_spot}---standard eviction results in complete state loss. When a node is drained, the kubelet issues a \texttt{SIGTERM} signal; upon expiration of \texttt{terminationGracePeriodSeconds} (or immediately upon Spot preemption deadlines), a \texttt{SIGKILL} signal destroys the address space, resetting the application to pristine zero state.
+When these stateful singleton workloads run on ephemeral cloud instances---most notably Amazon Web Services (AWS) EC2 Spot instances, which offer 70--90\% cost reductions relative to On-Demand pricing but are subject to preemption with a strict 120-second interruption notice (often preceded by an early EC2 Rebalance Recommendation signal) \cite{netflix_spot, aws_spot}---standard eviction causes complete state loss. When a node is drained, the kubelet issues \texttt{SIGTERM}; upon expiration of \texttt{terminationGracePeriodSeconds} (or hard Spot preemption), \texttt{SIGKILL} destroys the process address space.
 
-Historically, engineering teams prevent state loss by offloading volatile variables to distributed key-value storage (e.g., Redis clusters) \cite{redis_latency}. While viable, this paradigm introduces three critical trade-offs: (i) serialization and network latency overheads (hundreds of microseconds across nodes compared to $\approx 100$~ns for local L3 CPU cache/memory bus); (ii) complex application-level refactoring of existing monolithic and legacy binaries; and (iii) substantial infrastructure overhead for high-availability database clustering.
+A common pattern to avoid state loss is externalizing volatile variables to an in-memory data store such as Redis \cite{redis_latency}. While effective for shared state across replicas, externalizing internal process memory requires intrusive source-code refactoring and replaces nanosecond-scale local RAM accesses with sub-millisecond network round-trips across nodes.
 
-To avoid application refactoring while supporting infrastructure mobility, container live migration has emerged as an attractive alternative \cite{stoyanov2018, nadgowda2017}. In this paper, we explore the integration of checkpoint-restore mechanisms natively within Kubernetes. Our primary contributions are:
+Container checkpoint/restore offers an application-transparent alternative \cite{stoyanov2018, nadgowda2017, criu}. In this paper, we evaluate an end-to-end live migration pipeline built on native Kubernetes primitives. Our contributions are:
 \begin{itemize}
-    \item \textbf{Decoupled Migration Architecture:} We design an automated 9-step orchestration pipeline combining KEP-2008 checkpointing \cite{reber2022}, CRI-O, and Buildah to migrate containers across AWS EC2 physical instances without application modifications.
-    \item \textbf{Formalization of RTO vs. RPO Trade-offs:} We demonstrate that decoupling memory dumping from pod deletion minimizes client-observed cutover downtime ($T_{\text{blackout}} \in [797, 1078]$~ms), but introduces a bounded state drift ($\text{RPO} \approx 696$~ms), formalizing the distinction between freeze latency, cutover blackout, and cumulative disruption.
-    \item \textbf{Analysis of Service Mesh Topologies:} We evaluate how sidecar-free eBPF architectures (Cilium) resolve CRIU socket serialization crashes caused by in-pod loopback proxies in traditional sidecar meshes.
-    \item \textbf{Scalability and Spot Feasibility Modeling:} We model multi-stage migration latency across heap capacities ($26$~MB to $8$~GB) relative to the AWS 120-second termination window and analyze memory scaling bottlenecks.
+    \item \textbf{Decoupled Migration Pipeline:} We implement an automated DaemonSet operator combining KEP-2008 checkpointing \cite{reber2022}, Buildah OCI packaging, CRI-O v1.31 restoration, and Cilium eBPF routing across AWS EC2 nodes without modifying application code.
+    \item \textbf{Empirical Statistical Characterization ($N = 36$):} We evaluate 36 back-and-forth live migrations, decomposing client-perceived disruption into source-side freeze latency ($T_{\text{freeze}}$), target-side container restoration ($T_{\text{unfreeze}} \approx 537$~ms), and Kubelet PLEG status propagation delay ($\Delta t_{\text{pleg}}$).
+    \item \textbf{RTO vs. RPO Trade-off and Time-Rollback Analysis:} We formalize both decoupled (\texttt{KeepRunning: true}) and synchronous stop-and-copy modes, explaining the relationship between source-side state drift ($\Delta S_{\text{lost}}$) and post-restore target execution ($\Delta S_{\text{post-restore}}$).
+    \item \textbf{Source-Side Spot Evacuation Scaling Model:} We derive an affine latency scaling model calibrated to empirical fixed overheads and evaluate source-side evacuation feasibility under the 120-second Spot deadline for heaps from 26~MB to 8~GB.
 \end{itemize}
 
 \section{System Architecture}
 
-\subsection{Pipeline Overview}
-The migration architecture spans five foundational components: the Linux Checkpoint/Restore in Userspace subsystem (CRIU v3.16.1, packaged in Ubuntu 24.04 LTS), the Kubelet Checkpoint API (KEP-2008) \cite{reber2022}, the CRI-O container runtime (v1.31), Buildah for OCI packaging, and a sidecar-free Cilium eBPF Ingress architecture.
+\subsection{Pipeline Overview and CRIU Configuration}
+The migration architecture integrates five components on Ubuntu 24.04 LTS (Linux kernel 6.8): CRIU v4.3 \cite{criu}, the Kubelet Checkpoint API (KEP-2008) \cite{reber2022}, the CRI-O runtime (v1.31) configured with the \texttt{runc} OCI runtime, Buildah for OCI image packaging, and Cilium 1.16 in \texttt{kubeProxyReplacement} mode.
 
 \begin{figure*}[t]
 \centering
 \fbox{\parbox{0.95\textwidth}{
 \textbf{The 9-Stage Stateful Container Migration Sequence:} \\
-1. \textit{Trigger:} Node maintenance or an AWS Spot Interruption Notice received via EC2 Instance Metadata Service (IMDS). \\
-2. \textit{Memory Freeze \& Dump:} Kubelet Checkpoint API invokes CRIU via \texttt{POST /checkpoint/boutique/pod/container}. CRIU attaches via \texttt{ptrace(PTRACE\_SEIZE)}, halts execution threads, dumps address space to \texttt{pages-1.img}, and resumes source execution ($T_{\text{dump}} = T_{\text{freeze}} \approx 147$--$159$~ms). \\
-3. \textit{OCI Packaging:} Buildah embeds \texttt{checkpoint.tar} into a standard container layer tagged with CRI-O restore annotations ($T_{\text{build}} \approx 385$--$388$~ms). \\
-4. \textit{Registry Push:} The OCI image is pushed to the cluster-internal registry at \texttt{10.10.1.10:5000} ($T_{\text{push}} \approx 308$--$310$~ms). \\
-5. \textit{Cutover Initiation:} The source pod is terminated via the Kubernetes API; client-observed cutover blackout begins. \\
-6. \textit{Target Scheduling:} A target Pod manifest referencing the checkpoint OCI digest is scheduled onto \texttt{k8s-worker-2}. \\
-7. \textit{CRI-O Restore:} The CRI-O runtime reads the checkpoint annotation and invokes CRIU restore, mapping pages back into host RAM ($T_{\text{restore}} \approx 798$--$1080$~ms). \\
-8. \textit{Process Resumption:} The target process re-binds port \texttt{:8090} with its restored heap and register state. \\
-9. \textit{Ingress Retargeting:} Cilium eBPF L7 Ingress detects endpoint readiness and retargets upstream proxying to the new target Pod IP.
+1. \textit{Trigger:} Manual API invocation, node maintenance label, or AWS Spot Interruption / Rebalance signal ($T_{\text{detect}}$). \\
+2. \textit{Pre-Dump Probe \& Memory Freeze:} Operator records pre-dump counter $c_{\text{dump}}$ and calls \texttt{POST :10250/checkpoint/boutique/pod/container}. CRIU halts threads via \texttt{ptrace(PTRACE\_SEIZE)}, serializes anonymous pages to \texttt{checkpoint.tar}, and unfreezes the source container ($T_{\text{freeze}}$, median $144.0$~ms). \\
+3. \textit{OCI Packaging:} Buildah packages \texttt{checkpoint.tar} into a gzip-compressed OCI layer ($\approx 5.16$~MB) annotated with \texttt{io.kubernetes.cri-o.annotations.checkpoint.name} ($T_{\text{build}}$, median $370.5$~ms). \\
+4. \textit{Registry Push:} The OCI checkpoint image is pushed to the cluster-internal registry at \texttt{10.10.1.10:5000} ($T_{\text{push}}$, median $298.5$~ms). Source-side evacuation is now complete. \\
+5. \textit{Pre-Kill Probe \& Cutover Initiation:} Operator samples $c_{\text{kill}}$ ($t_{\text{kill}}$) and deletes the source pod with \texttt{gracePeriodSeconds=0}; the cutover blackout window ($T_{\text{blackout}}$) begins. \\
+6. \textit{Target Scheduling:} Target Pod manifest referencing the checkpoint OCI image is created with \texttt{spec.nodeName} pinned to the destination worker. \\
+7. \textit{CRI-O Pull \& Restore:} Target CRI-O pulls the checkpoint layer, validates matching bind mounts (\texttt{automountServiceAccountToken: false}), and invokes \texttt{runc/criu restore}, unfreezing the process at $T_{\text{unfreeze}} \approx 537$~ms. \\
+8. \textit{Process Resumption:} Target process re-binds \texttt{0.0.0.0:8090} and immediately resumes its 10~Hz counter loop in RAM. \\
+9. \textit{PLEG Sync \& Readiness Verification:} Kubelet updates Pod \texttt{status.phase} to \texttt{Running} in \texttt{kube-apiserver}; operator verifies \texttt{HTTP 200 OK} from the new Pod IP and records $c_{\text{restore}}$ ($T_{\text{restore}}$, median $1066.0$~ms).
 }}
-\caption{Detailed architectural sequence of the snapshot-consistent stateful live migration pipeline.}
+\caption{Architectural sequence of the decoupled snapshot-consistent live migration pipeline.}
 \label{fig:pipeline}
 \end{figure*}
 
-\subsection{Ingress Routing vs. L4 Socket Boundaries}
-When a pod migrates from \texttt{k8s-worker-1} to \texttt{k8s-worker-2}, its Pod IP changes (e.g., from \texttt{10.0.1.45} to \texttt{10.0.2.112}). If external clients connected directly to the Pod IP via plain L4 TCP, the 4-tuple (\textit{src\_ip, src\_port, dst\_ip, dst\_port}) would be invalidated, triggering kernel \texttt{RST} packets.
-
-Our architecture routes external traffic through an L7 Ingress Gateway (Cilium Ingress / Envoy). The ingress proxy terminates external client TCP/HTTP sessions. During migration:
+To allow a checkpointed container to restore inside a new network namespace with a different Pod IP on the target node, \texttt{/etc/criu/default.conf} is configured with five directives \cite{criu}:
 \begin{itemize}
-    \item External client connections remain established at the ingress proxy.
-    \item During the cutover blackout window ($T_{\text{blackout}}$), incoming requests are queued or retried by Envoy (configured with 3 retries on connect failure with a 25~ms backoff).
-    \item As soon as the target pod completes CRI-O restore and passes readiness probes, Cilium's eBPF datapath updates the ingress endpoint table, directing buffered traffic to the new Pod IP.
+    \item \texttt{tcp-close}: Restores listening sockets (\texttt{0.0.0.0:8090}) in the \texttt{LISTEN} state while closing any established sockets that are bound to the old Pod IP.
+    \item \texttt{skip-in-flight}: Instructs CRIU to ignore transient in-flight TCP connection handshakes occurring during active 50~Hz probing at the moment of \texttt{ptrace} seizure.
+    \item \texttt{skip-mnt /run/.containerenv}: Excludes CRI-O's transient metadata file mount, preventing mountpoint validation failures during \texttt{CRImportCheckpoint}.
+    \item \texttt{ext-unix-sk} and \texttt{shell-job}: Permits serialization of external UNIX domain sockets and container stdio descriptors.
 \end{itemize}
 
-\subsection{Service Mesh Topologies: Sidecar vs. Sidecar-Free}
-In traditional service mesh architectures (e.g., Istio), an Envoy proxy runs as a sidecar container inside the application pod namespace. Traffic is intercepted via \texttt{iptables PREROUTING} rules over the \texttt{127.0.0.1} loopback interface.
+\subsection{Network Cutover and Blackout Definition}
+When a pod migrates from \texttt{k8s-worker-1} (\texttt{10.244.2.0/24}) to \texttt{k8s-worker-2} (\texttt{10.244.1.0/24}), its Pod IP changes. Our test workload serves \texttt{HTTP/1.0} responses (closing the TCP connection after each reply) behind a Kubernetes Service ClusterIP and Cilium L7 Envoy Ingress without long-hold request buffering.
 
-When CRIU attempts to checkpoint a pod containing an active Envoy sidecar, two failure modes arise:
-\begin{enumerate}
-    \item \textbf{Loopback Socket Entanglement:} CRIU cannot serialize active TCP connections bound to \texttt{127.0.0.1} when the remote target host cannot guarantee identical socket descriptors and peer namespaces.
-    \item \textbf{Namespace-Locked Routing State:} Pod-level \texttt{iptables} NAT state and inter-container UNIX domain sockets cannot be serialized and restored independently of the application process.
-\end{enumerate}
+Consequently, during the cutover interval between source pod deletion ($t_{\text{kill}}$) and target endpoint readiness ($t_{\text{ready}}$), probes arriving at the Service or Ingress fail immediately (connection refused / \texttt{HTTP 503}). We define the cutover blackout window $T_{\text{blackout}}$ strictly as the unavailability interval during which consecutive probes fail—measured both internally by the operator clock ($t_{\text{ready}} - t_{\text{kill}}$) and externally as the maximum time gap between consecutive \texttt{HTTP 200 OK} responses on a 50~Hz ($\pm 20$~ms) prober.
 
-A \textit{sidecar-free} topology (Cilium eBPF Service Mesh) \cite{cilium} mitigates this issue by hosting Envoy at the node level. eBPF socket programs hook into socket events at the host cgroup boundary, avoiding namespace-locked proxies. Consequently, the application pod namespace contains only the isolated target process, enabling clean CRIU serialization.
+\subsection{Rationale for Sidecar-Free Networking}
+Kubelet's Checkpoint API (\texttt{POST /checkpoint/\{ns\}/\{pod\}/\{container\}}) checkpoints an individual container rather than an entire pod \cite{reber2022}. In a traditional sidecar service mesh (e.g., Istio), the \texttt{istio-proxy} Envoy container runs as a separate container sharing the pod's network namespace (\texttt{netns}) and intercepting traffic via pod-local \texttt{iptables} rules and \texttt{127.0.0.1} loopback connections.
+
+We hypothesize and argue from an architectural standpoint that sidecar-free eBPF networking (Cilium) simplifies container checkpointing for two reasons: (i) checkpointing only the application container leaves behind the sidecar's \texttt{iptables} NAT state and any persistent application-to-sidecar loopback sockets; and (ii) Cilium places L7 Envoy proxying and eBPF socket routing at the host level outside the pod namespace, keeping the container's \texttt{netns} clean. Confirming this experimentally against an Istio sidecar baseline and evaluating persistent \texttt{HTTP/1.1} keep-alive connections remain part of our future work.
 
 \section{Mathematical Latency, Drift, and Scalability Model}
 
-\subsection{Latency Decomposition: Disruption vs. Blackout}
-Client-observed service disruption during migration consists of two distinct phases:
+\subsection{Latency Decomposition and Timestamp Semantics}
+In our operator implementation (\texttt{05-live-migration-operator.yaml}), timestamps are recorded sequentially around each stage: $t_0$ (before checkpoint API call), $t_1$ (after checkpoint tar creation), $t_2$ (after Buildah commit), $t_3$ (after registry push), $t_{\text{kill}}$ (after the pre-delete counter probe $c_{\text{kill}}$, immediately before \texttt{DELETE /pods}), and $t_4$ (upon the first \texttt{HTTP 200 OK} from the restored pod after Kubelet reports \texttt{phase == Running}).
+
+The stage durations are therefore:
+\begin{align}
+T_{\text{freeze}} &= t_1 - t_0, \quad T_{\text{build}} = t_2 - t_1, \quad T_{\text{push}} = t_3 - t_2 \\
+T_{\text{restore}} &= t_4 - t_3, \quad T_{\text{blackout}} = t_4 - t_{\text{kill}} = T_{\text{restore}} - t_{\text{probe}}
+\end{align}
+where $t_{\text{probe}} = t_{\text{kill}} - t_3 \approx 1\text{--}2$~ms is the latency of the pre-delete HTTP probe used to read $c_{\text{kill}}$. This explains why operator-logged $T_{\text{blackout}}$ is consistently $1\text{--}2$~ms shorter than $T_{\text{restore}}$ (e.g., $797$~ms vs. $798$~ms, and $1078$~ms vs. $1080$~ms).
+
+Total client-perceived disruption combines the source-side freeze stutter (when threads are halted by \texttt{ptrace} and incoming requests stall in kernel socket queues) and the cutover blackout:
 \begin{equation}
 T_{\text{disruption}} = T_{\text{freeze}} + T_{\text{blackout}}
 \end{equation}
+while total end-to-end orchestration duration is:
+\begin{equation}
+T_{\text{total}} = T_{\text{freeze}} + T_{\text{build}} + T_{\text{push}} + T_{\text{restore}}
+\end{equation}
+
+\subsection{Decomposing Target Restoration and Counter Semantics}
+The operator logs three counter samples per migration: $\text{Counter}(c_{\text{dump}} \to c_{\text{kill}} \to c_{\text{restore}})$, where:
 \begin{itemize}
-    \item \textbf{Freeze Stutter ($T_{\text{freeze}}$):} During $T_{\text{dump}}$, CRIU attaches to the process via \texttt{PTRACE\_SEIZE} and halts thread execution while dumping memory pages from \texttt{/proc/PID/pagemap}. Client requests arriving during this window are queued in TCP socket buffers, experiencing a transient latency spike.
-    \item \textbf{Cutover Blackout ($T_{\text{blackout}}$):} The elapsed time between source pod termination ($t_{\text{kill}}$) and verified successful response from the target pod ($t_{\text{ready}}$):
-    \begin{equation}
-    T_{\text{blackout}} = t_{\text{ready}} - t_{\text{kill}} = T_{\text{restore}} + T_{\text{route\_sync}} \pm \delta_{\text{probe}}
-    \end{equation}
-    where $\delta_{\text{probe}} = 20$~ms represents the sampling discretization of the 50~Hz probing harness.
+    \item $c_{\text{dump}}$ is sampled on the source pod immediately prior to $t_0$.
+    \item $c_{\text{kill}}$ is sampled on the source pod at $t_{\text{kill}}$ (after $T_{\text{freeze}} + T_{\text{build}} + T_{\text{push}}$).
+    \item $c_{\text{restore}}$ is sampled on the target pod at $t_4$ (after Kubelet transitions the target pod to \texttt{status.phase == Running}).
 \end{itemize}
-The total end-to-end orchestration duration is:
+
+Because CRI-O invokes CRIU with \texttt{KeepRunning: true}, the source process continues incrementing at rate $\lambda = 10$~Hz during $T_{\text{build}} + T_{\text{push}}$ (and during the brief pre-seizure setup inside $T_{\text{freeze}}$). If the checkpoint captures state $S_{\text{ckpt}} \approx c_{\text{dump}} + 1$, the true number of source updates lost at cutover is:
 \begin{equation}
-T_{\text{total}} = T_{\text{dump}} + T_{\text{build}} + T_{\text{push}} + T_{\text{restore}}
+\Delta S_{\text{lost}} = c_{\text{kill}} - S_{\text{ckpt}} \approx \lambda \cdot (T_{\text{build}} + T_{\text{push}})
+\label{eq:lost}
+\end{equation}
+Correspondingly, the Recovery Point Objective (RPO) is:
+\begin{equation}
+\text{RPO} = \Delta t_{\text{drift}} = T_{\text{build}} + T_{\text{push}}
+\label{eq:rpo}
 \end{equation}
 
-\subsection{The RTO vs. RPO Trade-off}
-The migration orchestrator can operate in two distinct modes:
-
-\subsubsection{Mode A: Decoupled Snapshot (Evaluated)}
-The source container resumes execution immediately after memory dumping (\texttt{KeepRunning: true}) while Buildah packages and pushes the image ($T_{\text{build}} + T_{\text{push}}$). 
-
-This minimizes client blackout to $T_{\text{blackout}} \approx T_{\text{restore}}$ ($797$--$1078$~ms), but introduces state drift (uncommitted updates):
+Crucially, why is $c_{\text{restore}}$ strictly greater than $c_{\text{dump}}$ (e.g., $51 \to 60 \to 57$ in Run 1 and $77 \to 85 \to 79$ in Run 2)? On the target node, CRI-O and \texttt{runc restore} unfreeze the container at time $T_{\text{unfreeze}}$ after $t_3$, at which point the restored Python thread \textit{immediately resumes incrementing from $S_{\text{ckpt}}$ at 10~Hz}. However, the operator cannot probe the target pod IP until Kubelet's Pod Lifecycle Event Generator (PLEG, which relists container states on a 1~s periodic cycle) updates \texttt{Pod.status.phase = Running} in \texttt{kube-apiserver} at time $T_{\text{restore}} = T_{\text{unfreeze}} + \Delta t_{\text{pleg}}$. During $\Delta t_{\text{pleg}}$, the restored process accumulates $\Delta S_{\text{post-restore}}$ new ticks on the target node:
 \begin{equation}
-\text{RPO} = \Delta t_{\text{drift}} = t_{\text{kill}} - t_{\text{dump}} \approx T_{\text{build}} + T_{\text{push}} \approx 696\text{ ms}
+c_{\text{restore}} - c_{\text{dump}} \approx \lambda \cdot (T_{\text{restore}} - T_{\text{unfreeze}})
+\label{eq:post_restore}
 \end{equation}
-The number of uncommitted updates $\Delta S$ lost upon target cutover is bounded by:
-\begin{equation}
-\Delta S = \int_{t_{\text{dump}}}^{t_{\text{kill}}} \lambda(t) \, dt \approx \lambda \cdot (T_{\text{build}} + T_{\text{push}})
-\end{equation}
-where $\lambda$ is the state mutation rate. 
+Consequently, the difference $c_{\text{kill}} - c_{\text{restore}}$ ($3$ in Run 1; $6$ in Run 2) is \textit{not} the number of lost updates $\Delta S_{\text{lost}}$, but rather $\Delta S_{\text{lost}} - \Delta S_{\text{post-restore}}$.
 
-\subsubsection{Mode B: Synchronous Stop-and-Copy (Theoretical Reference)}
-The source container is paused before dumping and never resumed. This achieves zero state loss ($\text{RPO} \equiv 0$), but expands client blackout to the entire pipeline:
-\begin{equation}
-T_{\text{blackout}}^{\text{stop-and-copy}} = T_{\text{freeze}} + T_{\text{build}} + T_{\text{push}} + T_{\text{restore}} = T_{\text{total}}
-\end{equation}
-Empirically, $T_{\text{total}}$ spans $1642$--$1935$~ms, which is $27.4\%$--$50.1\%$ \textit{worse} than native cold reschedule ($1289$~ms). This establishes the fundamental trade-off: decoupling sacrifices $\approx 696$~ms of state freshness to achieve sub-second client cutover blackout.
+\subsection{RTO vs. RPO: Decoupled vs. Stop-and-Copy}
+In \textbf{Mode A (Decoupled, \texttt{KeepRunning: true})}, the source serves traffic during $T_{\text{build}} + T_{\text{push}}$, yielding $\text{RPO} = T_{\text{build}} + T_{\text{push}}$ ($\approx 669$~ms median) and $T_{\text{blackout}} \approx T_{\text{restore}}$. Clients reading state between $t_1$ and $t_{\text{kill}}$ observe counter values up to $c_{\text{kill}}$ that roll back to $S_{\text{ckpt}}$ when the target starts; transactional workloads therefore require an external write-ahead log (WAL) or idempotency keys.
 
-\subsection{State Rollback and Phantom Data Risks}
-In Mode A, clients that received responses between $t_{\text{dump}}$ and $t_{\text{kill}}$ observed state that is subsequently rolled back upon target restoration. In our experiments, clients observed counter values reaching $60$ (Run 1) and $85$ (Run 2), but target execution resumed at $57$ and $79$, respectively. For transactional workloads, this represents an observable time rollback risk that requires idempotent transaction journals or external write-ahead logs (WAL) to resolve.
+In \textbf{Mode B (Synchronous Stop-and-Copy, Analytical Reference)}, stopping the source container prior to dumping eliminates state drift ($\text{RPO} \equiv 0$, $\Delta S_{\text{lost}} \equiv 0$), but extends service unavailability to the entire pipeline ($T_{\text{blackout}}^{\text{stop-and-copy}} = T_{\text{total}}$, median $1878.0$~ms, or $45.7\%$ slower than cold reschedule).
 
-\subsection{Analytical Scalability Model for AWS Spot Preemption}
-Live migration on AWS EC2 Spot instances must complete within the strict 120-second preemption notice:
-\begin{equation}
-T_{\text{total}}(M_{\text{RSS}}) < 120\text{ seconds}
-\end{equation}
-Unlike idealized models that assume constant packaging times, all four pipeline stages scale with resident set size ($M_{\text{RSS}}$):
+\subsection{Source-Side Scalability Model for AWS Spot Preemption}
+When an AWS EC2 Spot instance receives a 120-second interruption notice, only the \textit{source node} is terminated at $t = 120$~s. Once the checkpoint image is pushed to the registry ($t_3$), source evacuation is complete; target-side pull and restoration ($T_{\text{restore}}$) proceed on the surviving destination node. Thus, the Spot deadline applies strictly to the \textbf{source-side evacuation time} $T_{\text{evac}}(M)$:
 \begin{align}
-T_{\text{total}}(M) = &\ \frac{M}{B_{\text{IO}}} + \left(\frac{M}{B_{\text{tar}}} + t_{\text{oci}}\right) \nonumber \\
-&+ \frac{M}{B_{\text{net}}} + \left(\frac{M}{B_{\text{restore}}} + t_{\text{runc}}\right)
+T_{\text{evac}}(M) = &\ T_{\text{detect}} + T_{\text{freeze}}(M) \nonumber \\
+&+ T_{\text{build}}(M) + T_{\text{push}}(M) < 120\text{ s}
+\label{eq:spot_evac}
 \end{align}
-where $B_{\text{IO}} \approx 125$~MB/s (EBS gp3 baseline), $B_{\text{net}} \approx 250$~MB/s (conservative sustained baseline for \texttt{m7i-flex.large}), $B_{\text{tar}} \approx 200$~MB/s, and $B_{\text{restore}} \approx 150$~MB/s. Table~\ref{tab:scaling} summarizes the projected scaling behavior.
+where $T_{\text{detect}} = 2.50$~s is the mean detection latency for a 5~s IMDSv2 poll interval. We model each stage as an affine function of dumpable heap size $M$ (in MB), separating fixed orchestration overheads from bandwidth-bound transfer:
+\begin{align}
+T_{\text{freeze}}(M) &= t_{\text{dump},0} + \frac{M}{B_{\text{IO}}}, \quad T_{\text{build}}(M) = t_{\text{build},0} + \frac{M}{B_{\text{tar}}} \label{eq:scale1} \\
+T_{\text{push}}(M) &= t_{\text{push},0} + \frac{M}{B_{\text{net}}} \label{eq:scale2a} \\
+\text{RPO}(M) &= T_{\text{build}}(M) + T_{\text{push}}(M) \label{eq:scale2b} \\
+T_{\text{restore}}(M) &= t_{\text{restore},0} + \frac{M}{B_{\text{net}}} + \frac{M}{B_{\text{restore}}} \label{eq:scale3} \\
+T_{\text{total}}(M) &= T_{\text{freeze}}(M) + \text{RPO}(M) + T_{\text{restore}}(M) \label{eq:scale4}
+\end{align}
+Note that $T_{\text{restore}}(M)$ explicitly includes both pulling the image over the network ($M / B_{\text{net}}$) and unpacking/mapping pages on the target node ($M / B_{\text{restore}}$). Calibrating fixed overheads to our $N = 36$ empirical medians at $M = 26$~MB gives $t_{\text{dump},0} = 0.04$~s, $t_{\text{build},0} = 0.24$~s, $t_{\text{push},0} = 0.19$~s, and $t_{\text{restore},0} = 0.79$~s, with conservative sustained uncached bandwidths $B_{\text{IO}} = 125$~MB/s (EBS \texttt{gp3}), $B_{\text{tar}} = 200$~MB/s, $B_{\text{net}} = 250$~MB/s (2~Gbps sustained on \texttt{m7i-flex.large}), and $B_{\text{restore}} = 150$~MB/s. Every entry in Table~\ref{tab:scaling} is computed directly from Eqs.~(\ref{eq:spot_evac})--(\ref{eq:scale4}).
 
 \begin{table}[h]
 \centering
-\caption{Analytical Scaling Projection vs. 120s Spot Deadline}
+\caption{Analytical Scaling Projection from Eqs.~(\ref{eq:spot_evac})--(\ref{eq:scale4}) vs. 120s Source-Side Spot Deadline}
 \label{tab:scaling}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{@{}lccccc@{}}
+\begin{tabular}{@{}lccccccc@{}}
 \toprule
-\textbf{Heap Size} & \textbf{$T_{\text{freeze}}$} & \textbf{$T_{\text{push}}$} & \textbf{Est. RPO} & \textbf{Est. $T_{\text{total}}$} & \textbf{Spot Feasibility} \\ \midrule
-26~MB (Evaluated) & 0.15~s & 0.10~s & 0.70~s & 1.64~s & Validated ($< 2$\% SLA) \\
-256~MB & 2.05~s & 1.02~s & 2.30~s & 5.12~s & Safe ($< 5$\% SLA) \\
-1024~MB (1~GB) & 8.19~s & 4.10~s & 9.22~s & 20.5~s & Feasible ($< 18$\% SLA) \\
-4096~MB (4~GB) & 32.8~s & 16.4~s & 36.9~s & 81.9~s & Bound Limit ($< 69$\% SLA) \\
-8192~MB (8~GB) & 65.5~s & 32.8~s & 73.7~s & 163.8~s & \textbf{Violates SLA} ($> 120$~s) \\ \bottomrule
+\textbf{Heap $M$} & \textbf{$T_{\text{freeze}}$} & \textbf{$T_{\text{build}}$} & \textbf{$T_{\text{push}}$} & \textbf{RPO} & \textbf{$T_{\text{restore}}$} & \textbf{$T_{\text{evac}}$ (\% SLA)} & \textbf{$T_{\text{total}}$} \\ \midrule
+26~MB (Model)$^*$ & 0.25~s & 0.37~s & 0.29~s & 0.66~s & 1.07~s & \textbf{3.41~s} (2.8\%) & 1.98~s \\
+256~MB & 2.09~s & 1.52~s & 1.21~s & 2.73~s & 3.52~s & \textbf{7.32~s} (6.1\%) & 8.34~s \\
+1024~MB (1~GB) & 8.23~s & 5.36~s & 4.29~s & 9.65~s & 11.71~s & \textbf{20.38~s} (17.0\%) & 29.59~s \\
+4096~MB (4~GB) & 32.81~s & 20.72~s & 16.57~s & 37.29~s & 44.48~s & \textbf{72.60~s} (60.5\%) & 114.58~s \\
+8192~MB (8~GB) & 65.58~s & 41.20~s & 32.96~s & 74.16~s & 88.17~s & \textbf{142.23~s} (118.5\%) & 227.91~s \\ \bottomrule
 \end{tabular}%
 }
+\vspace{1mm}
+\parbox{\columnwidth}{\footnotesize $^*$At $M = 26$~MB, measured median $T_{\text{freeze}}$ is $0.14$~s (vs. $0.25$~s uncached model) because Linux page cache buffers the $5.16$~MB compressed checkpoint archive in RAM.}
 \end{table}
 
-Critically, Table~\ref{tab:scaling} demonstrates that while heaps up to $4$~GB satisfy the 120-second threshold, $T_{\text{freeze}}$ and RPO grow substantially ($> 8$~s at 1~GB), confirming that single-pass dumping is ill-suited for large heaps without iterative pre-copying.
+Table~\ref{tab:scaling} shows two distinct regimes: (i) source-side Spot evacuation ($T_{\text{evac}} < 120$~s) succeeds for heaps up to $4$~GB ($72.60$~s, or $60.5\%$ of the 120~s budget) but fails at $8$~GB ($142.23$~s); and (ii) even at $1$~GB, single-pass dumping freezes the process for $T_{\text{freeze}} = 8.23$~s and incurs $\text{RPO} = 9.65$~s, confirming that multi-gigabyte workloads require iterative pre-copying.
 
 \section{Empirical Evaluation}
 
 \subsection{Experimental Setup}
-The testbed was deployed on AWS EC2 in region \texttt{eu-central-1} (Frankfurt) within a private VPC:
+The testbed was deployed on AWS EC2 in \texttt{eu-central-1} (Frankfurt):
 \begin{itemize}
-    \item \textbf{Control Plane:} 1x \texttt{c7i-flex.large} (2 vCPU, 4~GB RAM, Ubuntu 24.04 LTS, Linux 6.8).
-    \item \textbf{Worker Nodes:} 2x \texttt{m7i-flex.large} (2 vCPU, 8~GB RAM).
-    \item \textbf{Background Contention:} The full 11-microservice Google Online Boutique suite was continuously executed across the worker nodes to generate realistic CPU, memory, and network noisy-neighbor interference.
-    \item \textbf{Target Workload:} An in-memory stateful service executing a 10~Hz memory heap counter.
-    \item \textbf{Probing Engine:} An external HTTP prober querying the Cilium Ingress at 50~Hz (20~ms sampling intervals) to detect disruption windows.
+    \item \textbf{Nodes:} 1x \texttt{c7i-flex.large} control plane (\texttt{10.10.1.10}, hosting the local OCI registry \texttt{:5000} and Cilium Ingress) and 2x \texttt{m7i-flex.large} workers (\texttt{k8s-worker-1}, \texttt{k8s-worker-2}).
+    \item \textbf{Background Contention:} All 11 microservices of the Google Online Boutique suite were deployed across the worker nodes to create realistic multi-tenant CPU, memory, and CNI control-plane contention.
+    \item \textbf{Target Workload:} \texttt{live-stream-pod} running an in-memory 10~Hz counter on port 8090 (\texttt{python:3.12-slim} pre-pulled on both workers).
 \end{itemize}
 
-\subsection{Measured Results}
-Table~\ref{tab:results} summarizes the empirical measurements recorded across native cold eviction and two multi-hop CRIU migration runs.
+\subsection{Statistical Results Across $N = 36$ Migrations}
+Table~\ref{tab:stats} reports the complete statistical distribution across all $N = 36$ live migrations recorded in cluster \texttt{etcd} ($n = 20$ from \texttt{worker-1} to \texttt{worker-2}; $n = 16$ from \texttt{worker-2} to \texttt{worker-1}), and Table~\ref{tab:traces} compares two representative individual runs against the native cold reschedule baseline and analytical Mode B.
 
 \begin{table*}[t]
 \centering
-\caption{Empirical Benchmark Comparison: Proposed CRIU Stateful Migration vs. Native Kubernetes Eviction}
-\label{tab:results}
-\resizebox{0.95\textwidth}{!}{%
-\begin{tabular}{@{}lcccccccc@{}}
+\caption{Empirical Statistical Distribution Across $N = 36$ Multi-Hop CRIU Live Migrations on AWS EC2}
+\label{tab:stats}
+\resizebox{0.98\textwidth}{!}{%
+\begin{tabular}{@{}lccccccccc@{}}
 \toprule
-\textbf{Execution Run} & \textbf{Pipeline Path} & \textbf{$T_{\text{total}}$} & \textbf{$T_{\text{freeze}}$} & \textbf{$T_{\text{build}}$} & \textbf{$T_{\text{push}}$} & \textbf{$T_{\text{blackout}}$} & \textbf{$T_{\text{disruption}}$} & \textbf{Counter Continuity} \\ \midrule
-\textbf{Native Eviction (Baseline)} & \texttt{worker-2} $\to$ \texttt{worker-1} & 1289~ms & N/A & N/A & N/A & 1289~ms & \textbf{1289~ms} & $43544 \to 8$ (Total Reset) \\
-\textbf{CRIU Migration (Run 1)} & \texttt{worker-1} $\to$ \texttt{worker-2} & 1935~ms & 159~ms & 385~ms & 310~ms & 1078~ms & \textbf{1237~ms} & $51 \to 60 \to 57$ ($\Delta S = 3$) \\
-\textbf{CRIU Migration (Run 2)} & \texttt{worker-2} $\to$ \texttt{worker-1} & 1642~ms & 147~ms & 388~ms & 308~ms & 797~ms & \textbf{944~ms} & $77 \to 85 \to 79$ ($\Delta S = 6$) \\ \bottomrule
+\textbf{Direction / Subset} & \textbf{$T_{\text{freeze}}$ (ms)} & \textbf{$T_{\text{build}}$ (ms)} & \textbf{$T_{\text{push}}$ (ms)} & \textbf{RPO (ms)} & \textbf{$T_{\text{restore}}$ (ms)} & \textbf{$T_{\text{blackout}}$ (ms)} & \textbf{$T_{\text{disruption}}$ (ms)} & \textbf{$T_{\text{total}}$ (ms)} & \textbf{$c_{\text{kill}} - c_{\text{dump}}$ (ticks)} \\ \midrule
+\textbf{\texttt{worker-1} $\to$ \texttt{worker-2} ($n=20$)} & & & & & & & & & \\
+\quad Median ($p50$) / $p95$ & 144.0 / 158 & 368.5 / 400 & 293.0 / 310 & 664.0 / 703 & 1033.0 / 1533 & \textbf{1031.5} / 1532 & \textbf{1178.0} / 1673 & 1857.0 / 2358 & 7.5 / 8 \\
+\quad Mean $\pm$ SD [Min--Max] & $143.3 \pm 9.4$ & $370.9 \pm 17.1$ & $293.6 \pm 12.5$ & $664.6 \pm 27.6$ & $1112.9 \pm 249.2$ & $1111.2 \pm 249.3$ [817--1687] & $1254.5 \pm 250.1$ [958--1836] & $1920.8 \pm 248.7$ & $7.6 \pm 0.6$ [7--9] \\ \midrule
+\textbf{\texttt{worker-2} $\to$ \texttt{worker-1} ($n=16$)} & & & & & & & & & \\
+\quad Median ($p50$) / $p95$ & 145.0 / 155 & 372.5 / 384 & 301.5 / 308 & 672.5 / 688 & 1092.0 / 1474 & \textbf{1090.5} / 1472 & \textbf{1229.0} / 1622 & 1887.0 / 2277 & 7.0 / 8 \\
+\quad Mean $\pm$ SD [Min--Max] & $145.4 \pm 7.1$ & $366.6 \pm 16.4$ & $296.6 \pm 12.4$ & $663.2 \pm 27.9$ & $1160.2 \pm 235.9$ & $1158.8 \pm 235.7$ [797--1682] & $1304.1 \pm 238.1$ [944--1828] & $1968.8 \pm 238.0$ & $7.4 \pm 0.5$ [7--8] \\ \midrule
+\textbf{Combined All Runs ($N=36$)} & & & & & & & & & \\
+\quad Median ($p50$) / $p95$ & \textbf{144.0} / 156 & \textbf{370.5} / 389 & \textbf{298.5} / 310 & \textbf{669.0} / 696 & \textbf{1066.0} / 1533 & \textbf{1064.5} / 1532 & \textbf{1203.0} / 1673 & \textbf{1878.0} / 2358 & \textbf{7.0} / 8 \\
+\quad Mean $\pm$ SD [Min--Max] & $144.2 \pm 8.4$ & $369.0 \pm 16.7$ & $294.9 \pm 12.4$ & $663.9 \pm 27.4$ & $1133.9 \pm 241.1$ & $1132.4 \pm 241.1$ [797--1687] & $1276.6 \pm 242.6$ [944--1836] & $1942.1 \pm 241.8$ & $7.5 \pm 0.6$ [7--9] \\ \bottomrule
 \end{tabular}%
 }
 \end{table*}
 
-\subsection{Detailed Analysis of Results}
+\begin{table*}[t]
+\centering
+\caption{Comparison of Illustrative Traces and Operating Modes Against Native Cold Reschedule}
+\label{tab:traces}
+\resizebox{0.98\textwidth}{!}{%
+\begin{tabular}{@{}lccccccccc@{}}
+\toprule
+\textbf{Execution Mode / Trace ID} & \textbf{Path} & \textbf{$T_{\text{total}}$} & \textbf{$T_{\text{freeze}}$} & \textbf{$T_{\text{build}}$} & \textbf{$T_{\text{push}}$} & \textbf{$T_{\text{blackout}}$} & \textbf{$T_{\text{disruption}}$} & \textbf{RPO} & \textbf{$\text{Counter}(c_{\text{dump}} \to c_{\text{kill}} \to c_{\text{restore}})$} \\ \midrule
+\textbf{Native Cold Reschedule (Baseline)} & \texttt{w2} $\to$ \texttt{w1} & 1289~ms & N/A & N/A & N/A & 1289~ms & \textbf{1289~ms} & Total Loss & $43544 \to 8$ (100\% RAM Lost) \\
+\textbf{CRIU Decoupled (Trace \#35, Run 1)} & \texttt{w1} $\to$ \texttt{w2} & 1935~ms & 159~ms & 385~ms & 310~ms & 1078~ms & \textbf{1237~ms} ($-4.0\%$) & 695~ms & $51 \to 60 \to 57$ ($\Delta S_{\text{lost}}\approx 8, \Delta S_{\text{post}}\approx 5$) \\
+\textbf{CRIU Decoupled (Trace \#36, Run 2)} & \texttt{w2} $\to$ \texttt{w1} & 1642~ms & 147~ms & 388~ms & 308~ms & 797~ms & \textbf{944~ms} ($-26.8\%$) & 696~ms & $77 \to 85 \to 79$ ($\Delta S_{\text{lost}}\approx 7, \Delta S_{\text{post}}\approx 1$) \\
+\textbf{CRIU Median ($N=36$, Mode A)} & Bidirectional & 1878~ms & 144~ms & 370.5~ms & 298.5~ms & 1064.5~ms & \textbf{1203~ms} ($-6.7\%$) & 669~ms & $\Delta S_{\text{lost}} = 7.5 \pm 0.6$ ticks \\
+\textbf{Stop-and-Copy (Mode B, Analytical)} & Bidirectional & 1878~ms & 144~ms & 370.5~ms & 298.5~ms & 1878~ms & \textbf{1878~ms} ($+45.7\%$) & 0~ms & Zero Drift (Blackout $= T_{\text{total}}$) \\ \bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsection{Analysis of Findings}
 \begin{enumerate}
-    \item \textbf{Cutover Blackout vs. Cumulative Disruption:} 
-    In Run 2, the cutover blackout window was reduced to \textbf{797~ms} ($\pm 20$~ms), representing a \textbf{38.2\% reduction} relative to native cold reschedule (1289~ms). Across both runs, mean cutover blackout was $937.5$~ms (a 27.2\% improvement). 
-    However, when factoring in the freeze stutter ($T_{\text{freeze}} = 147$--$159$~ms), cumulative disruption was $944$~ms (Run 2, a 26.8\% improvement) and $1237$~ms (Run 1, a 4.0\% improvement).
-    \item \textbf{RPO and State Drift Verification:} 
-    In native eviction, the process state was entirely lost ($43544 \to 8$). Under CRIU migration, state continuity was preserved across nodes with a bounded rollback: $60 \to 57$ in Run 1 ($\Delta S = 3$) and $85 \to 79$ in Run 2 ($\Delta S = 6$). The measured loss of 6 updates in Run 2 is consistent with the theoretical prediction of equation (5) ($\lambda \cdot \Delta t_{\text{drift}} = 10 \times 0.696 \approx 7$). The lower loss in Run 1 ($\Delta S = 3$) reflects clock quantization and asynchronous pod teardown timing.
-    \item \textbf{Measurement Resolution:} The observation that $T_{\text{blackout}} = 797$~ms was marginally lower than CRI-O's logged $T_{\text{restore}} = 798$~ms falls well within the $\pm 20$~ms probing resolution.
+    \item \textbf{Source-Side Determinism vs. Target-Side PLEG Variance:} Across all $N = 36$ runs, source-side stages exhibit tight determinism: $T_{\text{freeze}} = 144.2 \pm 8.4$~ms, $T_{\text{build}} = 369.0 \pm 16.7$~ms, and $T_{\text{push}} = 294.9 \pm 12.4$~ms. In contrast, $T_{\text{restore}}$ spans $798$--$1688$~ms ($\text{SD} = 241.1$~ms; range $890$~ms).
+    \item \textbf{Proof of Unfreeze Timing via Counter Regression:} Performing ordinary least-squares regression of $(c_{\text{restore}} - c_{\text{dump}})$ against $T_{\text{restore}}$ across all $N = 36$ runs confirms Eq.~(\ref{eq:post_restore}) with Pearson correlation $r = 0.9624$, yielding slope $\hat{\lambda} = 9.96$~ticks/s (matching the 10.0~Hz timer) and x-intercept $T_{\text{unfreeze}} = 537.1$~ms. Thus, CRI-O and \texttt{runc restore} actually unfreeze the container on the target node in $\approx 537$~ms; the remaining $261$--$1151$~ms of $T_{\text{restore}}$ is Kubelet's 1~s PLEG status sync delay before reporting \texttt{phase == Running}.
+    \item \textbf{Resolution of the Run 1 vs. Run 2 Counter Paradox:} Across all $N = 36$ runs, $c_{\text{kill}} - c_{\text{dump}}$ is tightly bounded between $7$ and $9$ ticks (median $7.0$, mean $7.5 \pm 0.6$), matching Eq.~(\ref{eq:lost}). In Trace \#35 ($51 \to 60 \to 57$, $T_{\text{restore}} = 1080$~ms), the source incremented $9$ times ($51 \to 60$), and after unfreezing at $\approx 537$~ms on the target node, the restored process ticked $\approx 5$ times during the $543$~ms PLEG wait ($52 \to 57$). In Trace \#36 ($77 \to 85 \to 79$, $T_{\text{restore}} = 798$~ms), the PLEG wait was only $261$~ms ($798 - 537$~ms), so the restored counter ticked only $\approx 1$--$2$ times ($78 \to 79$).
 \end{enumerate}
 
 \section{Related Work}
-\subsection{Virtual Machine and Container Live Migration}
-Live migration was formalized at the hypervisor layer by Clark et al. \cite{clark2005}, utilizing iterative pre-copying of memory pages. In container virtualization, Stoyanov and Kollingbaum \cite{stoyanov2018} evaluated CRIU-based migration bottlenecks, showing that network transfer of memory pages dominates migration time. Nadgowda et al. \cite{nadgowda2017} developed Voyager to enable complete container migration across clouds. Reber \cite{reber2022} spearheaded the integration of checkpoint-restore mechanisms natively into Kubernetes via KEP-2008. Our study builds upon KEP-2008 by demonstrating end-to-end multi-node pod migration over production OCI registries.
-
-\subsection{Service Mesh Architectures}
-Traditional service meshes inject sidecars into application pod namespaces. Recent architectures, notably Cilium eBPF Service Mesh \cite{cilium}, migrate layer-7 routing to node-level proxies. We show that sidecar-free architectures eliminate in-pod loopback socket dependencies, resolving a primary impediment to container checkpointing.
+Clark et al. \cite{clark2005} introduced iterative pre-copy live migration for virtual machines. In container environments, Stoyanov and Kollingbaum \cite{stoyanov2018} evaluated CRIU migration overhead and image caching, while Nadgowda et al. \cite{nadgowda2017} presented Voyager, unifying CRIU memory checkpointing with union filesystem data migration in Docker. Reber \cite{reber2022} integrated forensic container checkpointing into Kubernetes via KEP-2008. Our work extends KEP-2008 into an automated node-to-node migration pipeline over CRI-O and Cilium eBPF \cite{cilium}, quantifying the interplay between CRIU freeze time, OCI registry packaging, and Kubelet PLEG readiness latency.
 
 \section{Threats to Validity and System Limitations}
 \begin{enumerate}
-    \item \textbf{Exploratory Sample Size:} The empirical results represent a dual-hop case study ($n=2$ per path). While sufficient to demonstrate architectural viability and state continuity, large-scale statistical campaigns ($N \ge 50$) are necessary to establish rigorous confidence intervals and tail latencies ($p95, p99$).
-    \item \textbf{State Rollback in Decoupled Mode:} Mode A incurs an RPO of $\approx 696$~ms. Applications requiring strict zero-loss must either accept stop-and-copy blackout ($> 1.6$~s) or implement application-level WAL.
-    \item \textbf{Memory Scalability Bounds:} Single-pass dumping is limited to workloads with moderate heap sizes ($\le 4$~GB). Multi-gigabyte heaps require iterative dirty-page pre-copying.
-    \item \textbf{L4 Protocol Scope:} Our evaluation utilized an HTTP-based stateful service behind an L7 ingress proxy. Workloads relying on direct long-lived L4 TCP or raw UDP connections require complementary connection migration mechanisms.
+    \item \textbf{Single-Run Cold Baseline \& Analytical Mode B:} While CRIU migration is evaluated across $N = 36$ runs, the native cold reschedule baseline ($1289$~ms) was captured as a single reference run, and Mode B (stop-and-copy) is derived analytically from the measured stage components. Multi-run baselines Including multi-replica stateless deployments with \texttt{PodDisruptionBudget} are planned.
+    \item \textbf{L4 Connection Closure (\texttt{tcp-close}):} Because \texttt{tcp-close} closes active TCP sockets on restore and our workload uses short-lived \texttt{HTTP/1.0} requests, persistent \texttt{HTTP/1.1} keep-alive, WebSocket, and UDP sessions were not tested.
+    \item \textbf{Single-Pass Memory Scaling:} Our empirical runs used a 26~MB container ($5.16$~MB compressed checkpoint). Validating multi-gigabyte heaps and integrating iterative pre-copy (\texttt{criu dump --pre-dump}) are required for large-memory workloads.
 \end{enumerate}
 
 \section{Conclusion}
-This paper presented an empirical evaluation of snapshot-consistent live migration for stateful containers in Kubernetes using CRI-O, CRIU, and sidecar-free Cilium eBPF. The architecture achieves sub-second cutover blackout (797~ms) and 4.0\%--26.8\% lower cumulative disruption than cold restart, while preserving in-memory state with a bounded RPO ($\approx 696$~ms). Future work will incorporate iterative pre-copying to enable zero-RPO migration on multi-gigabyte stateful workloads.
+We presented an empirical and analytical evaluation of snapshot-consistent container live migration in Kubernetes using CRI-O, CRIU v4.3, Buildah, and Cilium eBPF. Across $N = 36$ migrations on AWS EC2, the pipeline achieves a median cutover blackout of $1064.5$~ms (best $797$~ms) and median cumulative disruption of $1203.0$~ms (best $944$~ms) with a tightly bounded RPO of $669.0$~ms ($7.5 \pm 0.6$ ticks), while regression analysis ($r = 0.9624$) isolates Kubelet's 1~s PLEG sync loop as the primary source of post-restore tail latency.
 
 \section*{Artifact Availability}
-All manifests, orchestration scripts, operator code, and benchmarking harnesses are publicly available at: \url{https://github.com/musaxasmammedov7/final-research}.
+All manifests, Ansible playbooks, operator source code, and benchmarking scripts are publicly available at: \url{https://github.com/musaxasmammedov7/final-research}.
 
 \bibliographystyle{IEEEtran}
 \begin{thebibliography}{00}
 \bibitem{burns2016borg} B. Burns, B. Grant, D. Oppenheimer, E. Brewer, and J. Wilkes, ``Borg, Omega, and Kubernetes,'' \textit{Communications of the ACM}, vol. 59, no. 5, pp. 50--57, 2016.
 \bibitem{netflix_spot} Netflix Technology Blog, ``Creating Your Own EC2 Spot Market,'' Netflix Inc., 2015.
-\bibitem{aws_spot} Amazon Web Services, ``Spot Instance Interruptions,'' AWS Documentation, 2024.
+\bibitem{aws_spot} Amazon Web Services, ``Spot Instance Interruptions and EC2 Rebalance Recommendations,'' AWS Documentation, 2024.
 \bibitem{redis_latency} Redis Ltd., ``Redis Latency Problems Troubleshooting,'' \url{https://redis.io/docs/management/optimization/latency/}, 2024.
-\bibitem{stoyanov2018} R. Stoyanov and M. J. Kollingbaum, ``Efficient Live Migration of Linux Containers,'' in \textit{Proc. 13th Workshop on Virtualization in High-Performance Cloud Computing (VHPC)}, Springer, Cham, 2018, pp. 279--291.
-\bibitem{nadgowda2017} S. Nadgowda, C. Isci, and R. Koller, ``Voyager: Complete Container Migration,'' in \textit{Proc. 37th IEEE Int. Conf. on Distributed Computing Systems (ICDCS)}, 2017, pp. 2137--2144.
-\bibitem{clark2005} C. Clark, K. Fraser, S. Hand, J. G. Hansen, E. Jul, C. Limpach, I. Pratt, and A. Warfield, ``Live Migration of Virtual Machines,'' in \textit{Proc. 2nd USENIX Symp. on Networked Systems Design and Implementation (NSDI)}, 2005, pp. 273--286.
+\bibitem{stoyanov2018} R. Stoyanov and M. J. Kollingbaum, ``Efficient Live Migration of Linux Containers,'' in \textit{High Performance Computing: ISC High Performance 2018 International Workshops}, LNCS, vol. 11203, Springer, Cham, 2018, pp. 184--193.
+\bibitem{nadgowda2017} S. Nadgowda, S. Suneja, N. Bila, and C. Isci, ``Voyager: Complete Container State Migration,'' in \textit{Proc. IEEE 37th Int. Conf. on Distributed Computing Systems (ICDCS)}, 2017, pp. 2137--2142.
+\bibitem{criu} Checkpoint/Restore In Userspace, ``CRIU CLI Options and Architecture,'' \url{https://criu.org}, 2024.
 \bibitem{reber2022} A. Reber, ``Forensic Container Checkpointing in Kubernetes,'' \textit{Kubernetes Official Blog / CNCF}, Dec. 2022. [Online]. Available: https://kubernetes.io/blog/2022/12/05/forensic-container-checkpointing-alpha/
 \bibitem{cilium} Cilium Authors, ``Cilium: eBPF-based Networking, Observability, and Service Mesh,'' Linux Foundation, 2024.
-\bibitem{criu} Checkpoint/Restore In Userspace, ``CRIU Architecture and Core Internals,'' \url{https://criu.org}, 2024.
+\bibitem{clark2005} C. Clark, K. Fraser, S. Hand, J. G. Hansen, E. Jul, C. Limpach, I. Pratt, and A. Warfield, ``Live Migration of Virtual Machines,'' in \textit{Proc. 2nd USENIX Symp. on Networked Systems Design and Implementation (NSDI)}, 2005, pp. 273--286.
 \end{thebibliography}
 
 \end{document}
