@@ -22,6 +22,11 @@ spec:
   containers:
     - name: stream-server
       image: docker.io/library/python:3.12-slim
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
       command:
         - python3
         - -c
@@ -33,7 +38,7 @@ spec:
               "ram_counter": 0,
               "started_at": time.strftime("%H:%M:%S"),
               "pid": os.getpid(),
-              "node": "k8s-worker-1",
+              "node": os.environ.get("NODE_NAME", "k8s-worker-1"),
               "migrations": [],
           }
 
@@ -384,7 +389,7 @@ spec:
           <div id="toast"></div>
 
           <script>
-            let lastTs = performance.now(), maxGap = 0, isMigrating = false, curActiveNode = "", activeMode = "criu";
+            let lastTs = performance.now(), maxGap = 0, isMigrating = false, curActiveNode = "", activeMode = "criu", migrationStartTime = 0;
 
             function showToast(msg, isWarn) {
               const t = document.getElementById('toast');
@@ -401,6 +406,7 @@ spec:
               btnNative.disabled = true;
               isMigrating = true;
               activeMode = 'criu';
+              migrationStartTime = performance.now();
               document.getElementById('criu_text').innerText = 'Migrating via CRIU...';
               document.getElementById('criu_icon').innerText = '⏳';
               for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.add('active');
@@ -421,6 +427,7 @@ spec:
               btnNative.disabled = true;
               isMigrating = true;
               activeMode = 'native';
+              migrationStartTime = performance.now();
               document.getElementById('native_text').innerText = 'Evicting pod...';
               document.getElementById('native_icon').innerText = '⏳';
               for (let i = 1; i <= 4; i++) document.getElementById('st' + i).classList.remove('active');
@@ -449,7 +456,12 @@ spec:
                 const targetNode = (d.node === 'k8s-worker-1') ? 'k8s-worker-2' : 'k8s-worker-1';
                 document.getElementById('target_hint').innerText = 'Next Target: ' + targetNode;
 
-                if (curActiveNode && curActiveNode !== d.node && isMigrating) {
+                const elapsed = (now - migrationStartTime) / 1000;
+                const nodeChanged = curActiveNode && curActiveNode !== d.node;
+                const memoryReset = activeMode === 'native' && d.ram_counter < 50 && elapsed > 0.4;
+                const timedOut = isMigrating && elapsed > 4.0;
+
+                if (isMigrating && (nodeChanged || memoryReset || timedOut)) {
                   isMigrating = false;
                   document.getElementById('btn_criu').disabled = false;
                   document.getElementById('btn_native').disabled = false;
@@ -457,7 +469,7 @@ spec:
                   document.getElementById('criu_icon').innerText = '⚡';
                   document.getElementById('native_text').innerText = 'Native K8s Reschedule';
                   document.getElementById('native_icon').innerText = '❄️';
-                  if (activeMode === 'native') {
+                  if (activeMode === 'native' || memoryReset) {
                     showToast('⚠️ Native Reschedule Complete: Memory wiped to 0 (100% data loss)!', true);
                   } else {
                     showToast('✓ CRIU Stateful Migration Complete: Memory preserved across nodes!', false);

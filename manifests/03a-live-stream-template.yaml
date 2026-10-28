@@ -3,35 +3,37 @@ data:
   pod.json: '{"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "live-stream-pod",
     "namespace": "boutique", "labels": {"app": "live-stream"}}, "spec": {"automountServiceAccountToken":
     false, "nodeName": "k8s-worker-1", "tolerations": [{"operator": "Exists"}], "containers":
-    [{"name": "stream-server", "image": "docker.io/library/python:3.12-slim", "command":
-    ["python3", "-c", "import http.server, json, os, socket, time, urllib.request\nfrom
+    [{"name": "stream-server", "image": "docker.io/library/python:3.12-slim", "env":
+    [{"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}],
+    "command": ["python3", "-c", "import http.server, json, os, socket, time, urllib.request\nfrom
     threading import Thread\n\nSTATE = {\n    \"ram_counter\": 0,\n    \"started_at\":
-    time.strftime(\"%H:%M:%S\"),\n    \"pid\": os.getpid(),\n    \"node\": \"k8s-worker-1\",\n    \"migrations\":
-    [],\n}\n\ndef counter_loop():\n    while True:\n        STATE[\"ram_counter\"]
-    += 1\n        time.sleep(0.1)\n\nThread(target=counter_loop, daemon=True).start()\n\ndef
-    get_current_pod_ip():\n    try:\n        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n        s.connect((\"10.10.1.10\",
-    80))\n        ip = s.getsockname()[0]\n        s.close()\n        return ip\n    except
-    Exception:\n        return \"unknown\"\n\nHTML = \"\"\"<!DOCTYPE html><html lang=\"en\"><head><meta
-    charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Stateful
-    Container Live Migration Console</title>\n<style>\n  :root {\n    --bg: #07090e;\n    --card:
-    #0d121d;\n    --card-border: rgba(255, 255, 255, 0.08);\n    --card-hover: rgba(255,
-    255, 255, 0.12);\n    --cyan: #38bdf8;\n    --emerald: #10b981;\n    --emerald-glow:
-    rgba(16, 185, 129, 0.25);\n    --text: #f1f5f9;\n    --muted: #64748b;\n    --font-mono:
-    ui-monospace, \"SF Mono\", \"JetBrains Mono\", Menlo, Consolas, monospace;\n  }\n  *
-    { box-sizing: border-box; }\n  body {\n    font-family: -apple-system, BlinkMacSystemFont,
-    \"Segoe UI\", Roboto, \"Inter\", sans-serif;\n    background: var(--bg);\n    color:
-    var(--text);\n    margin: 0;\n    padding: 28px 20px;\n    min-height: 100vh;\n    background-image:
-    radial-gradient(circle at 50% -20%, rgba(56, 189, 248, 0.08), transparent 70%);\n  }\n  .container
-    { max-width: 1180px; margin: 0 auto; }\n  \n  /* Header */\n  .header {\n    display:
-    flex;\n    justify-content: space-between;\n    align-items: center;\n    border-bottom:
-    1px solid var(--card-border);\n    padding-bottom: 20px;\n    margin-bottom: 24px;\n  }\n  .brand
-    { display: flex; align-items: center; gap: 12px; }\n  .brand-badge {\n    background:
-    rgba(56, 189, 248, 0.1);\n    color: var(--cyan);\n    border: 1px solid rgba(56,
-    189, 248, 0.25);\n    font-family: var(--font-mono);\n    font-size: 11px;\n    font-weight:
-    700;\n    padding: 4px 8px;\n    border-radius: 6px;\n    letter-spacing: 0.5px;\n  }\n  .title
-    { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.3px; }\n  .subtitle
-    { font-size: 13px; color: var(--muted); margin: 4px 0 0; }\n  .header-links a
-    {\n    color: var(--cyan);\n    text-decoration: none;\n    font-size: 13px;\n    font-weight:
+    time.strftime(\"%H:%M:%S\"),\n    \"pid\": os.getpid(),\n    \"node\": os.environ.get(\"NODE_NAME\",
+    \"k8s-worker-1\"),\n    \"migrations\": [],\n}\n\ndef counter_loop():\n    while
+    True:\n        STATE[\"ram_counter\"] += 1\n        time.sleep(0.1)\n\nThread(target=counter_loop,
+    daemon=True).start()\n\ndef get_current_pod_ip():\n    try:\n        s = socket.socket(socket.AF_INET,
+    socket.SOCK_DGRAM)\n        s.connect((\"10.10.1.10\", 80))\n        ip = s.getsockname()[0]\n        s.close()\n        return
+    ip\n    except Exception:\n        return \"unknown\"\n\nHTML = \"\"\"<!DOCTYPE
+    html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,
+    initial-scale=1.0\"><title>Stateful Container Live Migration Console</title>\n<style>\n  :root
+    {\n    --bg: #07090e;\n    --card: #0d121d;\n    --card-border: rgba(255, 255,
+    255, 0.08);\n    --card-hover: rgba(255, 255, 255, 0.12);\n    --cyan: #38bdf8;\n    --emerald:
+    #10b981;\n    --emerald-glow: rgba(16, 185, 129, 0.25);\n    --text: #f1f5f9;\n    --muted:
+    #64748b;\n    --font-mono: ui-monospace, \"SF Mono\", \"JetBrains Mono\", Menlo,
+    Consolas, monospace;\n  }\n  * { box-sizing: border-box; }\n  body {\n    font-family:
+    -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Inter\", sans-serif;\n    background:
+    var(--bg);\n    color: var(--text);\n    margin: 0;\n    padding: 28px 20px;\n    min-height:
+    100vh;\n    background-image: radial-gradient(circle at 50% -20%, rgba(56, 189,
+    248, 0.08), transparent 70%);\n  }\n  .container { max-width: 1180px; margin:
+    0 auto; }\n  \n  /* Header */\n  .header {\n    display: flex;\n    justify-content:
+    space-between;\n    align-items: center;\n    border-bottom: 1px solid var(--card-border);\n    padding-bottom:
+    20px;\n    margin-bottom: 24px;\n  }\n  .brand { display: flex; align-items: center;
+    gap: 12px; }\n  .brand-badge {\n    background: rgba(56, 189, 248, 0.1);\n    color:
+    var(--cyan);\n    border: 1px solid rgba(56, 189, 248, 0.25);\n    font-family:
+    var(--font-mono);\n    font-size: 11px;\n    font-weight: 700;\n    padding: 4px
+    8px;\n    border-radius: 6px;\n    letter-spacing: 0.5px;\n  }\n  .title { font-size:
+    20px; font-weight: 700; margin: 0; letter-spacing: -0.3px; }\n  .subtitle { font-size:
+    13px; color: var(--muted); margin: 4px 0 0; }\n  .header-links a {\n    color:
+    var(--cyan);\n    text-decoration: none;\n    font-size: 13px;\n    font-weight:
     600;\n    background: rgba(255, 255, 255, 0.04);\n    border: 1px solid var(--card-border);\n    padding:
     8px 16px;\n    border-radius: 8px;\n    transition: all 0.2s ease;\n  }\n  .header-links
     a:hover { background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248,
@@ -150,25 +152,27 @@ data:
     colspan=\"7\" class=\"empty-state\">No live migrations executed yet. Click \"Trigger
     Live Migration\" above or run benchmark script.</td></tr>\n      </tbody>\n    </table>\n  </div>\n</div>\n\n<div
     id=\"toast\"></div>\n\n<script>\n  let lastTs = performance.now(), maxGap = 0,
-    isMigrating = false, curActiveNode = \"\", activeMode = \"criu\";\n\n  function
-    showToast(msg, isWarn) {\n    const t = document.getElementById(''toast'');\n    t.innerText
+    isMigrating = false, curActiveNode = \"\", activeMode = \"criu\", migrationStartTime
+    = 0;\n\n  function showToast(msg, isWarn) {\n    const t = document.getElementById(''toast'');\n    t.innerText
     = msg;\n    t.style.borderColor = isWarn ? ''#ef4444'' : ''var(--cyan)'';\n    t.style.display
     = ''block'';\n    setTimeout(() => { t.style.display = ''none''; }, 5000);\n  }\n\n  async
     function triggerCriuMigration() {\n    const btnCriu = document.getElementById(''btn_criu'');\n    const
     btnNative = document.getElementById(''btn_native'');\n    btnCriu.disabled = true;\n    btnNative.disabled
-    = true;\n    isMigrating = true;\n    activeMode = ''criu'';\n    document.getElementById(''criu_text'').innerText
-    = ''Migrating via CRIU...'';\n    document.getElementById(''criu_icon'').innerText
-    = ''\u23f3'';\n    for (let i = 1; i <= 4; i++) document.getElementById(''st''
-    + i).classList.add(''active'');\n\n    try {\n      const resp = await fetch(''/live/migrate'',
-    { method: ''POST'' });\n      const data = await resp.json();\n      showToast(''\u26a1
-    CRIU pipeline dispatched: '' + data.source + '' \u2794 '' + data.target, false);\n    }
-    catch (err) {\n      showToast(''CRIU trigger sent: pipeline executing...'', false);\n    }\n  }\n\n  async
-    function triggerNativeReschedule() {\n    const btnCriu = document.getElementById(''btn_criu'');\n    const
+    = true;\n    isMigrating = true;\n    activeMode = ''criu'';\n    migrationStartTime
+    = performance.now();\n    document.getElementById(''criu_text'').innerText = ''Migrating
+    via CRIU...'';\n    document.getElementById(''criu_icon'').innerText = ''\u23f3'';\n    for
+    (let i = 1; i <= 4; i++) document.getElementById(''st'' + i).classList.add(''active'');\n\n    try
+    {\n      const resp = await fetch(''/live/migrate'', { method: ''POST'' });\n      const
+    data = await resp.json();\n      showToast(''\u26a1 CRIU pipeline dispatched:
+    '' + data.source + '' \u2794 '' + data.target, false);\n    } catch (err) {\n      showToast(''CRIU
+    trigger sent: pipeline executing...'', false);\n    }\n  }\n\n  async function
+    triggerNativeReschedule() {\n    const btnCriu = document.getElementById(''btn_criu'');\n    const
     btnNative = document.getElementById(''btn_native'');\n    btnCriu.disabled = true;\n    btnNative.disabled
-    = true;\n    isMigrating = true;\n    activeMode = ''native'';\n    document.getElementById(''native_text'').innerText
-    = ''Evicting pod...'';\n    document.getElementById(''native_icon'').innerText
-    = ''\u23f3'';\n    for (let i = 1; i <= 4; i++) document.getElementById(''st''
-    + i).classList.remove(''active'');\n\n    try {\n      const resp = await fetch(''/live/reschedule'',
+    = true;\n    isMigrating = true;\n    activeMode = ''native'';\n    migrationStartTime
+    = performance.now();\n    document.getElementById(''native_text'').innerText =
+    ''Evicting pod...'';\n    document.getElementById(''native_icon'').innerText =
+    ''\u23f3'';\n    for (let i = 1; i <= 4; i++) document.getElementById(''st'' +
+    i).classList.remove(''active'');\n\n    try {\n      const resp = await fetch(''/live/reschedule'',
     { method: ''POST'' });\n      const data = await resp.json();\n      showToast(''\u2744\ufe0f
     Native eviction dispatched: '' + data.source + '' \u2794 '' + data.target, true);\n    }
     catch (err) {\n      showToast(''Native eviction sent: restarting container...'',
@@ -180,13 +184,16 @@ data:
     = d.node;\n      document.getElementById(''pod_ip'').innerText = d.pod_ip + ''
     (PID '' + d.pid + '')'';\n\n      const targetNode = (d.node === ''k8s-worker-1'')
     ? ''k8s-worker-2'' : ''k8s-worker-1'';\n      document.getElementById(''target_hint'').innerText
-    = ''Next Target: '' + targetNode;\n\n      if (curActiveNode && curActiveNode
-    !== d.node && isMigrating) {\n        isMigrating = false;\n        document.getElementById(''btn_criu'').disabled
+    = ''Next Target: '' + targetNode;\n\n      const elapsed = (now - migrationStartTime)
+    / 1000;\n      const nodeChanged = curActiveNode && curActiveNode !== d.node;\n      const
+    memoryReset = activeMode === ''native'' && d.ram_counter < 50 && elapsed > 0.4;\n      const
+    timedOut = isMigrating && elapsed > 4.0;\n\n      if (isMigrating && (nodeChanged
+    || memoryReset || timedOut)) {\n        isMigrating = false;\n        document.getElementById(''btn_criu'').disabled
     = false;\n        document.getElementById(''btn_native'').disabled = false;\n        document.getElementById(''criu_text'').innerText
     = ''Stateful Migration (CRIU)'';\n        document.getElementById(''criu_icon'').innerText
     = ''\u26a1'';\n        document.getElementById(''native_text'').innerText = ''Native
     K8s Reschedule'';\n        document.getElementById(''native_icon'').innerText
-    = ''\u2744\ufe0f'';\n        if (activeMode === ''native'') {\n          showToast(''\u26a0\ufe0f
+    = ''\u2744\ufe0f'';\n        if (activeMode === ''native'' || memoryReset) {\n          showToast(''\u26a0\ufe0f
     Native Reschedule Complete: Memory wiped to 0 (100% data loss)!'', true);\n        }
     else {\n          showToast(''\u2713 CRIU Stateful Migration Complete: Memory
     preserved across nodes!'', false);\n        }\n      }\n      curActiveNode =
@@ -216,8 +223,10 @@ data:
     \"application/json\")\n                    self.send_header(\"Connection\", \"close\")\n                    self.end_headers()\n                    self.wfile.write(res_data)\n            except
     Exception as err:\n                self.send_response(500)\n                self.send_header(\"Content-Type\",
     \"application/json\")\n                self.send_header(\"Connection\", \"close\")\n                self.end_headers()\n                self.wfile.write(json.dumps({\"error\":
-    str(err)}).encode(\"utf-8\"))\n            return\n\n        # Audit records are accepted only directly from the in-cluster operator.\n        # External requests routed via Ingress (Envoy) carry X-Forwarded-For / X-Envoy-External-Address and are rejected.\n        if
-    self.headers.get(\"X-Forwarded-For\") or self.headers.get(\"X-Envoy-External-Address\"):\n            self.send_response(403)\n            self.send_header(\"Connection\",
+    str(err)}).encode(\"utf-8\"))\n            return\n\n        # Audit records are
+    accepted only directly from the in-cluster operator.\n        # External requests
+    routed via Ingress (Envoy) carry X-Forwarded-For / X-Envoy-External-Address and
+    are rejected.\n        if self.headers.get(\"X-Forwarded-For\") or self.headers.get(\"X-Envoy-External-Address\"):\n            self.send_response(403)\n            self.send_header(\"Connection\",
     \"close\")\n            self.end_headers()\n            return\n        if self.path.startswith(\"/live/record\"):\n            length
     = int(self.headers.get(\"Content-Length\", \"0\"))\n            payload = json.loads(self.rfile.read(length).decode(\"utf-8\"))\n            STATE[\"node\"]
     = payload.get(\"target\", STATE[\"node\"])\n            STATE[\"migrations\"].append(payload)\n            self.send_response(200)\n            self.send_header(\"Content-Type\",
