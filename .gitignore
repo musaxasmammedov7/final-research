@@ -23,3 +23,5 @@ checkpoints/
 # Python bytecode
 __pycache__/
 *.pyc
+*.aux
+paper/paper_stateful_live_migration.pdf
