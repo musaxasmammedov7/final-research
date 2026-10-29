@@ -52,12 +52,12 @@ We evaluated cutover disruption through concurrent dual-clock measurement: direc
 | **Operator Welch's t-test** | $t(40.81) = 1.91$ | — | **$p = 0.0628$** |
 | **External 50 Hz Prober Median ($T_{\text{blackout}}^{\text{ext}}$)** | **1080.0 ms** | **1040.0 ms** | **+40.0 ms (+3.8%)** |
 | **External 50 Hz Prober Mean $\pm$ SD** | $1148.2 \pm 241.6\text{ ms}$ | $1025.5 \pm 231.3\text{ ms}$ | Difference: $+122.7\text{ ms}$ ($U = 252.0, p = 0.0648$) |
-| **Paired Difference ($T_{\text{ext}} - T_{\text{op}}$)** | Mean $+15.8 \pm 14.7\text{ ms}$ [95% CI: $11.0, 20.6$] | Mean $+18.5 \pm 13.8\text{ ms}$ [95% CI: $12.1, 24.9$] | Range: $-12\dots+48\text{ ms}$ ($\approx 30\text{ ms}$ propagation) |
+| **Paired Difference ($T_{\text{ext}} - T_{\text{op}}$)** | Mean $+15.8 \pm 14.7\text{ ms}$ [95% CI: $11.0, 20.6$] | Mean $+18.5 \pm 13.8\text{ ms}$ [95% CI: $12.5, 24.5$] | Range: $-12\dots+48\text{ ms}$ (tens of ms propagation) |
 | **RAM State Preservation** | **100% Intact** (Heap preserved) | **0% (Reset to zero)** | Bit-exact state continuity |
 | **Kubelet Status Variance** | $\sigma = 241.1\text{ ms}$ | $\sigma = 231.2\text{ ms}$ | Dominated by 1 s PLEG relisting ($1000/\sqrt{12} \approx 288.7\text{ ms}$) |
 
 > [!NOTE]
-> The two-sided Mann-Whitney U test ($p = 0.0660$) confirms that process heap restoration exhibits bounded cutover overhead relative to cold pod initialization. Across all 56 paired runs, external Service recovery follows operator reporting with a cohort mean lag of $+15.8\text{ ms}$ (CRIU) and $+18.5\text{ ms}$ (cold), spanning $-12$ to $+48\text{ ms}$. Under the uniform sampling model ($E[\text{offset}] = 10 - 25 = -15\text{ ms}$), the observed mean lag is consistent with $\approx 30\text{ ms}$ Service routing propagation, with paired variance ($\sigma = 14.7\text{ ms}$ CRIU, $13.8\text{ ms}$ cold) matching the theoretical sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing ($\sqrt{(50^2 + 20^2)/12} \approx 15.5\text{ ms}$).
+> The two-sided Mann-Whitney U test ($p = 0.0660$) confirms that process heap restoration exhibits bounded cutover overhead relative to cold pod initialization. Across all 56 paired runs, external Service recovery follows operator reporting with a cohort mean lag of $+15.8\text{ ms}$ (CRIU) and $+18.5\text{ ms}$ (cold), spanning $-12$ to $+48\text{ ms}$. Under the dual-sampling model, the observed mean lag reflects tens of milliseconds of Service routing propagation, with paired variance ($\sigma = 14.7\text{ ms}$ CRIU, $13.8\text{ ms}$ cold) matching the theoretical sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing ($\sqrt{(50^2 + 20^2)/12} \approx 15.5\text{ ms}$).
 
 ---
 
