@@ -57,7 +57,7 @@ We evaluated cutover disruption through concurrent dual-clock measurement: direc
 | **Kubelet Status Variance** | $\sigma = 241.1\text{ ms}$ | $\sigma = 231.2\text{ ms}$ | Dominated by 1 s PLEG relisting ($1000/\sqrt{12} \approx 288.7\text{ ms}$) |
 
 > [!NOTE]
-> The two-sided Mann-Whitney U test ($p = 0.0660$) confirms that process heap restoration exhibits bounded cutover overhead relative to cold pod initialization. Across all 56 paired runs, external Service recovery follows operator reporting with a cohort mean lag of $+15.8\text{ ms}$ (CRIU) and $+18.5\text{ ms}$ (cold), spanning $-12$ to $+48\text{ ms}$. Under the dual-sampling model, the observed mean lag reflects tens of milliseconds of Service routing propagation, with paired variance ($\sigma = 14.7\text{ ms}$ CRIU, $13.8\text{ ms}$ cold) matching the theoretical sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing ($\sqrt{(50^2 + 20^2)/12} \approx 15.5\text{ ms}$).
+> The two-sided Mann-Whitney U test does not reject the null hypothesis of equal distributions at $\alpha = 0.05$ ($p = 0.0660$; Hodges-Lehmann 95% CI includes zero: $[-18.0, +249.0]\text{ ms}$), reflecting an underpowered sample size given the high PLEG variance ($\sigma \approx 240\text{ ms}$) rather than formal proof of equivalence. Across all 56 paired runs, external Service recovery follows operator reporting with a cohort mean lag of $+15.8\text{ ms}$ (CRIU) and $+18.5\text{ ms}$ (cold), spanning $-12$ to $+48\text{ ms}$. Under the dual-sampling model, the observed mean lag reflects tens of milliseconds of Service routing propagation, with paired variance ($\sigma = 14.7\text{ ms}$ CRIU, $13.8\text{ ms}$ cold) matching the theoretical sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing ($\sqrt{(50^2 + 20^2)/12} \approx 15.5\text{ ms}$).
 
 ---
 
@@ -148,7 +148,7 @@ python3 scripts/reproduce_statistics.py
 This loads `data/benchmark_56_runs.csv` and outputs:
 * Operator cutover metrics: medians (1064.5 ms vs. 1019.0 ms), means ($1132.4\text{ ms}$ vs. $1007.0\text{ ms}$), Welch's $t=1.91$, Hodges-Lehmann difference $+136.0\text{ ms}$, Mann-Whitney $U = 252.5, p = 0.0660$.
 * External 50 Hz prober metrics: medians (1080.0 ms vs. 1040.0 ms), means ($1148.2\text{ ms}$ vs. $1025.5\text{ ms}$), $U = 252.0, p = 0.0648$.
-* Paired difference distributions ($T_{\text{ext}} - T_{\text{op}}$): CRIU $+15.8\text{ ms}$ (95% CI $[+15.7, +16.0]$), Cold $+18.5\text{ ms}$ (95% CI $[+17.3, +19.7]$), $\max \le 24\text{ ms}$.
+* Paired difference distributions ($T_{\text{ext}} - T_{\text{op}}$): CRIU $+15.8\text{ ms}$ (95% CI $[+11.0, +20.6]$), Cold $+18.5\text{ ms}$ (95% CI $[+12.5, +24.5]$), per-run range over all 56 runs: $-12$ to $+48\text{ ms}$.
 
 ### Prerequisites for Live AWS Cluster Deployment
 * [Terraform](https://www.terraform.io/) $\ge$ 1.5.0
