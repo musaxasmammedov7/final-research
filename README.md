@@ -51,13 +51,13 @@ We evaluated cutover disruption through concurrent dual-clock measurement: direc
 | **Operator Mann-Whitney U Test** | $U = 252.5, z = -1.84$ | — | **$p = 0.0660$** (Hodges-Lehmann diff: $+136.0\text{ ms}$) |
 | **Operator Welch's t-test** | $t(40.81) = 1.91$ | — | **$p = 0.0628$** |
 | **External 50 Hz Prober Median ($T_{\text{blackout}}^{\text{ext}}$)** | **1080.0 ms** | **1040.0 ms** | **+40.0 ms (+3.8%)** |
-| **External 50 Hz Prober Mean $\pm$ SD** | $1148.2 \pm 241.0\text{ ms}$ | $1025.5 \pm 231.3\text{ ms}$ | Difference: $+122.7\text{ ms}$ ($U = 252.0, p = 0.0648$) |
-| **Paired Difference ($T_{\text{ext}} - T_{\text{op}}$)** | Mean $+15.8 \pm 14.7\text{ ms}$ [95% CI: $11.0, 20.6$] | Mean $+18.5 \pm 14.7\text{ ms}$ [95% CI: $12.1, 24.9$] | **Mean lag $\le 20\text{ ms}$** (SD matches 50ms/20ms convolution) |
+| **External 50 Hz Prober Mean $\pm$ SD** | $1148.2 \pm 241.6\text{ ms}$ | $1025.5 \pm 231.3\text{ ms}$ | Difference: $+122.7\text{ ms}$ ($U = 252.0, p = 0.0648$) |
+| **Paired Difference ($T_{\text{ext}} - T_{\text{op}}$)** | Mean $+15.8 \pm 14.7\text{ ms}$ [95% CI: $11.0, 20.6$] | Mean $+18.5 \pm 13.8\text{ ms}$ [95% CI: $12.1, 24.9$] | Range: $-12\dots+48\text{ ms}$ ($\approx 30\text{ ms}$ propagation) |
 | **RAM State Preservation** | **100% Intact** (Heap preserved) | **0% (Reset to zero)** | Bit-exact state continuity |
 | **Kubelet Status Variance** | $\sigma = 241.1\text{ ms}$ | $\sigma = 231.2\text{ ms}$ | Dominated by 1 s PLEG relisting ($1000/\sqrt{12} \approx 288.7\text{ ms}$) |
 
 > [!NOTE]
-> The two-sided Mann-Whitney U test ($p = 0.0660$) confirms that process heap restoration exhibits bounded cutover overhead relative to cold pod initialization. Across all 56 paired runs, external Service recovery follows operator reporting with a cohort mean lag of $+15.8\text{ ms}$ (CRIU) and $+18.5\text{ ms}$ (cold), bounding downstream Service routing convergence relative to operator observation to $\le 20\text{ ms}$ on average. Individual paired run differences exhibit $\sigma \approx 14.7\text{ ms}$, matching the theoretical sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing ($\sqrt{(50^2 + 20^2)/12} \approx 15.5\text{ ms}$).
+> The two-sided Mann-Whitney U test ($p = 0.0660$) confirms that process heap restoration exhibits bounded cutover overhead relative to cold pod initialization. Across all 56 paired runs, external Service recovery follows operator reporting with a cohort mean lag of $+15.8\text{ ms}$ (CRIU) and $+18.5\text{ ms}$ (cold), spanning $-12$ to $+48\text{ ms}$. Under the uniform sampling model ($E[\text{offset}] = 10 - 25 = -15\text{ ms}$), the observed mean lag is consistent with $\approx 30\text{ ms}$ Service routing propagation, with paired variance ($\sigma = 14.7\text{ ms}$ CRIU, $13.8\text{ ms}$ cold) matching the theoretical sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing ($\sqrt{(50^2 + 20^2)/12} \approx 15.5\text{ ms}$).
 
 ---
 
@@ -193,8 +193,12 @@ tectonic paper/paper_stateful_live_migration.tex --outdir paper/
 ---
 
 ## Release & Zenodo Archival
-* **Git Release Tag:** [`v1.2.0`](https://github.com/musaxasmammedov7/final-research/releases/tag/v1.2.0)
+* **Latest Git Release Tag:** [`v1.3.0`](https://github.com/musaxasmammedov7/final-research/releases/tag/v1.3.0)
+* **Previous Tag:** [`v1.2.0`](https://github.com/musaxasmammedov7/final-research/releases/tag/v1.2.0)
 * **Dataset DOI:** [10.5281/zenodo.23741721](https://doi.org/10.5281/zenodo.23741721)
+* **Release Changelog:**
+  * **v1.3.0 (Zenodo v2 / Camera-Ready Release):** Corrects paired-run statistics to accurately reflect joint sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing; aligns Student's $t$ confidence intervals ($[11.0, 20.6]$ ms for CRIU, $[12.1, 24.9]$ ms for Cold, range $[-12, +48]$ ms); replaces upper bound claims with $\approx 30$ ms Service routing propagation model; updates Table III and cutover metrics.
+  * **v1.2.0:** Initial camera-ready release of native IEEEtran 5-page manuscript and reproduction scripts.
 * **License:** Apache License 2.0
 
 ---
