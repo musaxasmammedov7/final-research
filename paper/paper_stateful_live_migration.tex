@@ -214,7 +214,7 @@ Table~\ref{tab:stats} summarizes measurements across $N = 36$ CRIU migrations ($
 \textbf{Native Cold Baseline ($N=20$)} & & & & & & & & & \\
 \quad Median ($p50$) / $p95$ & N/A & N/A & N/A & Total Loss & 1019.0 / 1244 & \textbf{1019.0} / 1244 & \textbf{1019.0} / 1244 & \textbf{1019.0} / 1244 & \textbf{100\% State Lost} \\
 \quad Mean $\pm$ SD [95\% CI] & N/A & N/A & N/A & Total Loss & $1007.0 \pm 231.2$ & $1007.0 \pm 231.2$ [905.7, 1108.3] & $1007.0 \pm 231.2$ & $1007.0 \pm 231.2$ & Reset to 0 [1--6] \\ \midrule
-\multicolumn{10}{@{}l@{}}{\textbf{Inferential Tests ($T_{\text{blackout}}$):} Mann-Whitney $U = 252.5, p = 0.0660$; Hodges-Lehmann median diff = $+136.0\text{ ms}$ (95\% CI $[-18.0, +252.0]\text{ ms}$); Welch's $t(40.8) = 1.91, p = 0.0628$; Mean diff = $+125.4\text{ ms}$} \\
+\multicolumn{10}{@{}l@{}}{\textbf{Inferential Tests ($T_{\text{blackout}}$):} Mann-Whitney $U = 252.5, p = 0.0660$; Hodges-Lehmann median diff = $+136.0\text{ ms}$ (95\% CI $[-18.0, +249.0]\text{ ms}$); Welch's $t(40.8) = 1.91, p = 0.0628$; Mean diff = $+125.4\text{ ms}$} \\
 \multicolumn{10}{@{}l@{}}{(95\% CI $[-6.7, +257.4]\text{ ms}$, Welch $t$). CIs of cohort means are normal-approximations. External 50~Hz Prober ($T_{\text{blackout}}^{\text{ext}}$): CRIU median $1080.0\text{ ms}$ ($1148.2 \pm 241.6\text{ ms}$) vs. Cold $1040.0\text{ ms}$ ($1025.5 \pm 231.3\text{ ms}$).} \\ \bottomrule
 \end{tabular}%
 }

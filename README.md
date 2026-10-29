@@ -197,7 +197,7 @@ tectonic paper/paper_stateful_live_migration.tex --outdir paper/
 * **Previous Tag:** [`v1.2.0`](https://github.com/musaxasmammedov7/final-research/releases/tag/v1.2.0)
 * **Dataset DOI:** [10.5281/zenodo.23741721](https://doi.org/10.5281/zenodo.23741721)
 * **Release Changelog:**
-  * **v1.3.0 (Zenodo v2 / Camera-Ready Release):** Corrects paired-run statistics to accurately reflect joint sampling convolution of 50 ms apiserver polling and 20 ms HTTP probing; aligns Student's $t$ confidence intervals ($[11.0, 20.6]$ ms for CRIU, $[12.1, 24.9]$ ms for Cold, range $[-12, +48]$ ms); replaces upper bound claims with $\approx 30$ ms Service routing propagation model; updates Table III and cutover metrics.
+  * **v1.3.0 (Zenodo v2 / Camera-Ready Release):** Synchronizes manuscript and reproduction suite: adds statistical power and Spot budget limitations, clarifies asymptotic normal-approximation for cohort means, reports paired 95% CIs ($[+11.0, +20.6]$ ms CRIU, $[+12.5, +24.5]$ ms cold; per-run range over all 56 runs: $-12$ to $+48$ ms, tens of milliseconds Service propagation), and aligns Hodges-Lehmann CI to $[-18.0, +249.0]$ ms strictly from data.
   * **v1.2.0:** Initial camera-ready release of native IEEEtran 5-page manuscript and reproduction scripts.
 * **License:** Apache License 2.0
 
