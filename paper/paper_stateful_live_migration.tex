@@ -321,6 +321,9 @@ We populated a contiguous heap buffer of $M \in \{64, 128, 256, 512, 1024\}$~MB 
 
 Three systems insights emerge:
 \begin{enumerate}
+\setlength{\itemsep}{1pt}
+\setlength{\parskip}{0pt}
+\setlength{\parsep}{0pt}
     \item \textbf{Bit-Exact Restoration within Spot SLA:} In single-trial scaling ($N=1$), all heaps up to 1024~MB restored with 100\% SHA-256 integrity. Under worst-case Spot detection ($T_{\text{detect}}^{\text{worst}} = 5.0$~s) and gzip, source evacuation took 55.09~s (45.9\% of the 120~s SLA). Between 512~MB and 1024~MB, $T_{\text{freeze}}$ jumped $9.8\times$ from dirty writeback and $T_{\text{push}}$ grew $3.2\times$, while gzip $T_{\text{build}}$ scaled linearly ($2.0\times$). Projecting to 2~GB suggests default gzip nears the 120~s deadline ($\approx 105$--$130$~s), requiring uncompressed packaging for multi-gigabyte state.
     \item \textbf{EBS gp3 Storage Throughput and Writeback in $T_{\text{freeze}}$:} From 26~MB to 512~MB, $T_{\text{freeze}}$ remains sub-second (144 $\to$ 760~ms) via page cache buffering. At 1~GB, uncommitted dirty memory hits 783.6~MB (\texttt{vm.dirty\_background\_ratio = 10}), triggering kernel flushers. The observed write throughput of $1029.2\text{ MiB} / 7.464\text{ s} \approx 137.9\text{ MiB/s}$ ($144.6\text{ MB/s}$) is consistent with AWS EBS \texttt{gp3} baseline limits (125~MiB/s \cite{aws_ebs}) combined with page caching and co-located service memory pressure.
     \item \textbf{Gzip Incompressibility and \texttt{--disable-compression} Speedup:} Incompressible weights produce OCI layers matching heap size. Single-threaded gzip $T_{\text{build}}$ takes 32.060~s at 1~GB. Passing \texttt{--disable-compression} (\texttt{-D}) slashes packaging to \textbf{13.743~s} ($2.3\times$ speedup), trimming worst-case evacuation to \textbf{36.78~s} (30.6\% of Spot budget). Over VPC links (1029~MiB pulls in 8.5~s over 1~Gbps baseline), disabling compression is optimal.
@@ -342,16 +345,16 @@ Our workload employs \texttt{HTTP/1.0} with CRIU's \texttt{tcp-close}; persisten
 \textit{Security Considerations:} Checkpoint images contain plaintext secrets. Production deployment necessitates: (1) cryptographic checkpoint encryption at rest, (2) mutual TLS and signed OCI images, and (3) replacing root DaemonSets with scoped capabilities (\texttt{CAP\_CHECKPOINT\_RESTORE} \cite{kernel_cap}, \texttt{CAP\_SYS\_PTRACE}).
 
 \section{Conclusion}
-We presented an empirical study of checkpoint/restore pod migration in Kubernetes using CRI-O, CRIU v4.3, Buildah, and Cilium eBPF. Across $N = 36$ migrations and $N = 20$ cold reschedules on AWS EC2, cutover blackout showed an overhead of 45.5~ms in median (+4.5\%) and 125.4~ms in mean (+12.5\%, 95\% CI $[-6.7, +257.4]$~ms; Hodges-Lehmann diff: 136.0~ms; $p = 0.0660$). Variance is governed by Kubelet status reporting (1~s PLEG relisting and status manager synchronization) rather than memory instantiation, with CRI-O profiling confirming unfreezing at 478--516~ms, while paired concurrent probing confirms downstream EndpointSlice routing converges within the 20~ms sampling resolution. In exploratory scaling up to 1024~MB, uncompressed packaging slashes build time from 32.06~s to 13.74~s ($2.3\times$, evacuating in 36.78~s within the 120~s Spot deadline) with 100\% SHA-256 integrity, while writeback throughput (137.9~MiB/s) aligns with EBS gp3 baseline storage limits at 1~GB. Checkpointing eliminates external persistence tiers, trading bounded state drift (0.56--3.16~s under \texttt{-D} vs. 0.67--7.48~s under gzip) for 1.77--5.64~s stop-and-copy cutover at $\le 256$~MB under \texttt{-D} (1.88--9.96~s under gzip). Single-container checkpointing severs loopback sidecars, favoring node-level routing.
+We presented an empirical study of checkpoint/restore pod migration in Kubernetes using CRI-O, CRIU v4.3, Buildah, and Cilium eBPF. Across $N = 36$ migrations and $N = 20$ cold reschedules on AWS EC2, cutover blackout showed an overhead of 45.5~ms in median (+4.5\%) and 125.4~ms in mean (+12.5\%, 95\% CI $[-6.7, +257.4]$~ms; Hodges-Lehmann diff: 136.0~ms; $p = 0.0660$). Variance is governed by Kubelet status reporting (1~s PLEG relisting and status manager synchronization) rather than container memory instantiation, with CRI-O profiling confirming unfreezing at 478--516~ms, while paired concurrent probing confirms downstream EndpointSlice routing converges within the 20~ms sampling resolution. In exploratory scaling up to 1024~MB, uncompressed packaging slashes build time from 32.06~s to 13.74~s ($2.3\times$, evacuating in 36.78~s within the 120~s Spot deadline) with 100\% SHA-256 integrity, while writeback throughput (137.9~MiB/s) aligns with EBS gp3 baseline storage limits at 1~GB. Checkpointing eliminates external persistence tiers, trading bounded state drift (0.56--3.16~s under \texttt{-D} vs. 0.67--7.48~s under gzip) for 1.77--5.64~s stop-and-copy cutover at $\le 256$~MB under \texttt{-D} (1.88--9.96~s under gzip). Single-container checkpointing severs loopback sidecars, favoring node-level routing.
 
 \section*{Artifact Availability}
 Manifests, operator code, raw CSV data for all 56 paired runs, and reproduction statistical scripts are open-source: \url{https://github.com/musaxasmammedov7/final-research}.
 
-\vspace{-3.5mm}
+\vspace{-1.5mm}
 \bibliographystyle{IEEEtran}
 \begin{thebibliography}{00}
-\fontsize{5.8pt}{6.6pt}\selectfont
-\setlength{\itemsep}{-4.0pt}
+\footnotesize
+\setlength{\itemsep}{0.2pt}
 \setlength{\parskip}{0pt}
 \bibitem{burns2016borg} B. Burns et al., ``Borg, Omega, and Kubernetes,'' \textit{CACM}, vol. 59, no. 5, pp. 50--57, 2016.
 \bibitem{netflix_spot} Netflix TechBlog, ``Creating Your Own EC2 Spot Market,'' Netflix Inc., 2015.
